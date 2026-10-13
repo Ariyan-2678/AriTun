@@ -6,3 +6,5 @@ devdata*/
 release-assets/
 npm/*/vendor/
 npm/*/*.tgz
+
+node_modules/
