@@ -121,6 +121,7 @@ func usage() {
 
 Usage:
   aritun http <port> [--subdomain NAME] [--auth user:pass]
+  aritun http all [--include-ephemeral] [--ports 3000,8080]   publish all web ports as HTTP
   aritun tcp  <port>
   aritun all  [--ports 3000,8080] [--exclude 445,135] [--http-only|--tcp-only]
   aritun status [--admin http://host:9090]
@@ -141,6 +142,7 @@ Global flags:
 Examples:
   aritun http 3000
   aritun http 8080 --subdomain demo --auth admin:s3cret
+  aritun http all                    # all web ports as HTTPS URLs
   aritun tcp 3389
   aritun all
   aritun status        # derives the admin URL from --server
@@ -187,6 +189,11 @@ func normalizeArgs(args []string) []string {
 }
 
 func cmdHTTP(args []string) error {
+	// `aritun http all` → discover and publish every web port as HTTP.
+	if len(args) > 0 && args[0] == "all" {
+		return cmdHTTPAll(args[1:])
+	}
+
 	var g globals
 	fs := flag.NewFlagSet("http", flag.ContinueOnError)
 	subdomain := fs.String("subdomain", "", "custom subdomain (default: random)")
@@ -214,6 +221,56 @@ func cmdHTTP(args []string) error {
 		Subdomain: sub,
 		BasicAuth: *auth,
 	}}
+	return serve(&g, tunnels)
+}
+
+// cmdHTTPAll implements `aritun http all`: discover local web ports and
+// publish each as an HTTP tunnel with a p<port> subdomain.
+func cmdHTTPAll(args []string) error {
+	var g globals
+	fs := flag.NewFlagSet("http all", flag.ContinueOnError)
+	portsFlag := fs.String("ports", "", "comma separated ports; skips discovery")
+	excludeFlag := fs.String("exclude", "", "comma separated ports to skip")
+	includeEphemeral := fs.Bool("include-ephemeral", false,
+		"also publish high-numbered dynamic ports")
+	httpPortsFlag := fs.String("http-ports", "", "extra ports to treat as web services")
+	g.register(fs)
+	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+
+	opts := discoveryOptions(g, parseIntSet(*excludeFlag))
+	opts.ExcludeEphemeral = !*includeEphemeral
+	if *portsFlag != "" {
+		ports, err := parseIntList(*portsFlag)
+		if err != nil {
+			return err
+		}
+		opts.Ports = ports
+	}
+
+	extraWeb := parseIntSet(*httpPortsFlag)
+
+	fmt.Fprintln(os.Stderr, "scanning local listeners...")
+	found, err := client.DiscoverLocalPorts(opts)
+	if err != nil {
+		return fmt.Errorf("port discovery: %w", err)
+	}
+	if len(found) == 0 {
+		return fmt.Errorf("no listening TCP ports found on this machine")
+	}
+
+	var tunnels []protocol.Tunnel
+	for _, p := range found {
+		if client.LooksLikeWeb(p, extraWeb) {
+			tunnels = append(tunnels, protocol.Tunnel{
+				Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
+			})
+		}
+	}
+	if len(tunnels) == 0 {
+		return fmt.Errorf("no web ports found (%d ports scanned); try --http-ports or --include-ephemeral", len(found))
+	}
 	return serve(&g, tunnels)
 }
 
