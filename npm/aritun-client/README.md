@@ -1,11 +1,11 @@
-# aritun-sys
+# aritun-client
 
 AriTun client — expose local services through your own server (self-hosted ngrok alternative).
 
 ## Install
 
 ```bash
-npm install -g aritun-sys
+npm install -g aritun-client
 ```
 
 ## Usage

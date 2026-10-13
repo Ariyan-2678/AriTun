@@ -23,7 +23,7 @@ aritun all
 
 ```bash
 # client (your machine)
-npm install -g aritun-sys
+npm install -g aritun-client
 
 # server (your VPS)
 npm install -g aritun-server
@@ -123,7 +123,7 @@ internal/client/    dialing, SOCKS5 proxy, discovery, reconnect
 internal/server/    sessions, routing, registry, dashboard
 internal/protocol/  handshake, messages, yamux framing
 internal/tlsutil/   self-signed control certificate
-npm/aritun-sys/     npm package (client)
+npm/aritun-client/   npm package (client)
 npm/aritun-server/  npm package (server)
 scripts/            release packaging
 test/               unit and end-to-end tests

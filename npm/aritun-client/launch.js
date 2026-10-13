@@ -33,7 +33,7 @@ const binPath = path.join(
 if (!fs.existsSync(binPath)) {
   console.error(
     `aritun-launch: binary not found at ${binPath}\n` +
-      `Run: npm rebuild ${process.env.npm_package_name || "aritun-sys"}`
+      `Run: npm rebuild ${process.env.npm_package_name || "aritun-client"}`
   );
   process.exit(1);
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Download the AriTun binary for this platform from GitHub Releases.
-// Used as "postinstall" by both aritun-sys and aritun-server.
+// Used as "postinstall" by both aritun-client and aritun-server.
 //
 // Reads from env:
 //   ARITUN_BIN_NAME   required — "aritun" or "aritund"
