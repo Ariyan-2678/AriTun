@@ -19,24 +19,33 @@ aritun all
 
 ## Quick start
 
+**Install via npm (recommended):**
+
+```bash
+# client (your machine)
+npm install -g aritun-sys
+
+# server (your VPS)
+npm install -g aritun-server
+```
+
+**Or download directly:** [GitHub Releases](https://github.com/Ariyan-2678/AriTun/releases)
+
 **Server (Linux VPS):**
 
 ```bash
-./build.sh linux/amd64
-sudo install -m755 dist/aritund-linux-amd64 /usr/local/bin/aritund
-sudo aritund --gen-token | sudo tee /etc/aritun/token
+aritund --gen-token | sudo tee /etc/aritun/token
 # see SETUP.md for Caddy, DNS, and systemd setup
 ```
 
 **Client (your machine):**
 
 ```powershell
-# Windows
 setx ARITUN_SERVER "wss://yourdomain.com/control"
 setx ARITUN_TOKEN "<server token>"
 setx ARITUN_PROXY "socks5://127.0.0.1:10808"   # optional
 
-.\dist\aritun-windows-amd64.exe http 3000
+aritun http 3000
 ```
 
 Full setup guide: [SETUP.md](SETUP.md)
@@ -114,6 +123,9 @@ internal/client/    dialing, SOCKS5 proxy, discovery, reconnect
 internal/server/    sessions, routing, registry, dashboard
 internal/protocol/  handshake, messages, yamux framing
 internal/tlsutil/   self-signed control certificate
+npm/aritun-sys/     npm package (client)
+npm/aritun-server/  npm package (server)
+scripts/            release packaging
 test/               unit and end-to-end tests
 install/            systemd templates
 ```

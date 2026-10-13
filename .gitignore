@@ -3,3 +3,6 @@
 *.pem
 dist/
 devdata*/
+release-assets/
+npm/*/vendor/
+npm/*/*.tgz
