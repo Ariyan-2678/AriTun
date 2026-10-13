@@ -1,7 +1,5 @@
 module github.com/Ariyan-2678/aritun
 
-// AriTun was previously published from github.com/Ariyan-2678/tunnel.
-
 go 1.22
 
 require (

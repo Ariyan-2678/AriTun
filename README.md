@@ -1,6 +1,6 @@
 # AriTun
 
-AriTun is a self-hosted way to expose local services from behind NAT.
+AriTun is a self-hosted way to expose local services from behind NAT — like ngrok, but on your own server.
 
 ```text
 aritun http 3000
@@ -16,6 +16,30 @@ aritun all
   https://p3000.aritun.example.com  ->  http://localhost:3000
   tcp port 20003                    ->  tcp://localhost:22
 ```
+
+## Quick start
+
+**Server (Linux VPS):**
+
+```bash
+./build.sh linux/amd64
+sudo install -m755 dist/aritund-linux-amd64 /usr/local/bin/aritund
+sudo aritund --gen-token | sudo tee /etc/aritun/token
+# see SETUP.md for Caddy, DNS, and systemd setup
+```
+
+**Client (your machine):**
+
+```powershell
+# Windows
+setx ARITUN_SERVER "wss://yourdomain.com/control"
+setx ARITUN_TOKEN "<server token>"
+setx ARITUN_PROXY "socks5://127.0.0.1:10808"   # optional
+
+.\dist\aritun-windows-amd64.exe http 3000
+```
+
+Full setup guide: [SETUP.md](SETUP.md)
 
 ## Architecture
 
