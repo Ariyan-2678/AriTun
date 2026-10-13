@@ -1,0 +1,38 @@
+# Caddyfile example for a fresh AriTun deployment.
+# Replace aritun.example.com with your hostname; DNS needs both the apex and
+# wildcard records pointed at the server, DNS-only (not proxied) for TCP routes.
+#
+# Build Caddy with both modules:
+#   xcaddy build v2.11.7 \
+#     --with github.com/caddy-dns/cloudflare \
+#     --with github.com/caddyserver/caddy/v2/modules/caddytls
+#
+# Set CLOUDFLARE_API_TOKEN in the Caddy systemd service environment using a
+# protected EnvironmentFile/credential. Do not commit the token to this file.
+
+{
+	admin off
+}
+
+# Existing sites belong in their own blocks and can remain unchanged.
+# existing.example.com {
+#     reverse_proxy 127.0.0.1:3000
+# }
+
+# Control WebSocket endpoint; the client connects to wss://aritun.example.com/control.
+aritun.example.com {
+	encode zstd gzip
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:9001
+}
+
+# Public HTTP forwarding endpoints: https://<subdomain>.aritun.example.com
+*.aritun.example.com {
+	encode zstd gzip
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:9001
+}

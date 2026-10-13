@@ -1,0 +1,45 @@
+[Unit]
+Description=AriTun server (aritund)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ARITUN_DOMAIN=aritun.yourdomain.com
+Environment=ARITUN_TOKEN_FILE=/etc/aritun/token
+# Add public IPs if clients connect by public IP instead of the domain.
+Environment=ARITUN_CONTROL_HOSTS=
+
+ExecStart=/usr/local/bin/aritund \
+    --domain ${ARITUN_DOMAIN} \
+    --token-file ${ARITUN_TOKEN_FILE} \
+    --control-addr :9443 \
+    --http-addr 127.0.0.1:9001 \
+    --admin-addr 127.0.0.1:9090 \
+    --tcp-range 20000-20999 \
+    --data-dir /var/lib/aritun \
+    --control-hosts ${ARITUN_CONTROL_HOSTS}
+Restart=on-failure
+RestartSec=3
+
+# Dedicated unprivileged account. StateDirectory creates /var/lib/aritun.
+StateDirectory=aritun
+StateDirectoryMode=0700
+User=aritun
+Group=aritun
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aritun
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

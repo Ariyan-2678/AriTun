@@ -1,0 +1,37 @@
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+WorkingDirectory=/var/lib/caddy
+
+# Without these, Caddy falls back to its working directory for its ACME
+# storage, gets permission denied, and exits with status 1 and no message.
+Environment=HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy/.config
+Environment=XDG_DATA_HOME=/var/lib/caddy/.local/share
+
+ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+# Binding :80 and :443 as a non-root user needs this capability. Grant it on
+# the binary once:  setcap cap_net_bind_service=+ep /usr/local/bin/caddy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

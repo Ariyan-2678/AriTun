@@ -1,0 +1,21 @@
+# Normalise text files to LF in the repository. Without this, git on Windows
+# (core.autocrlf=true) rewrites shell scripts to CRLF on checkout and they fail
+# on the Linux server with "$'\r': command not found".
+* text=auto
+
+*.sh      text eol=lf
+*.service text eol=lf
+Caddyfile* text eol=lf
+*.go      text eol=lf
+*.py      text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+go.mod    text eol=lf
+go.sum    text eol=lf
+VERSION   text eol=lf
+
+*.exe   binary
+*.dll   binary
+*.pem   binary
+dist/   -text
