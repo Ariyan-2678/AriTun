@@ -8,6 +8,9 @@ const https = require("https");
 const { execFileSync } = require("child_process");
 
 const BIN_NAME = "aritun";
+// GitHub Release asset prefix — matches the npm package name so the release
+// page is unambiguous (aritun-client-… = client, aritun-server-… = server).
+const ASSET_PREFIX = "aritun-client";
 const VERSION = (
   process.env.ARITUN_VERSION ||
   process.env.npm_package_version ||
@@ -30,7 +33,7 @@ function platformTriple() {
 }
 
 function assetName(os, arch) {
-  const base = `${BIN_NAME}-${os}-${arch}`;
+  const base = `${ASSET_PREFIX}-${os}-${arch}`;
   return os === "windows" ? `${base}.zip` : `${base}.tar.gz`;
 }
 

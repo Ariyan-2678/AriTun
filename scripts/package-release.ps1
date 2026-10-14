@@ -15,14 +15,24 @@ $binaries = Get-ChildItem $dist -File | Where-Object { $_.Name -match '^(aritun|
 if (-not $binaries) { throw "no binaries in dist/" }
 
 foreach ($b in $binaries) {
+  # Map dist binary name → release-asset name so the GitHub release page is
+  # unambiguous: aritun-client-… = client, aritun-server-… = server.
+  $assetBase = if ($b.BaseName -like "aritund-*") {
+    "aritun-server-" + $b.BaseName.Substring("aritund-".Length)
+  } elseif ($b.BaseName -like "aritun-*") {
+    "aritun-client-" + $b.BaseName.Substring("aritun-".Length)
+  } else {
+    $b.BaseName
+  }
+
   if ($b.Name -like "*.exe") {
     # Windows: zip
-    $zipName = "$($b.BaseName).zip"
+    $zipName = "$assetBase.zip"
     Compress-Archive -Path $b.FullName -DestinationPath (Join-Path $out $zipName) -Force
     Write-Host "  + $zipName"
   } else {
     # Unix: tar.gz
-    $tarName = "$($b.Name).tar.gz"
+    $tarName = "$assetBase.tar.gz"
     $tmp = Join-Path $out $b.Name
     Copy-Item $b.FullName $tmp -Force
     tar -czf (Join-Path $out $tarName) -C $out $b.Name
