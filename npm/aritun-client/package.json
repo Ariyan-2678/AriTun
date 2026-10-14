@@ -1,6 +1,6 @@
 {
   "name": "aritun-client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "AriTun client — expose local services through your own server (self-hosted ngrok alternative)",
   "license": "MIT",
   "repository": {

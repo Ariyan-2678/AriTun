@@ -356,20 +356,30 @@ func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunn
 	// rewrite path (strip the port segment)
 	r2 := r.Clone(r.Context())
 	r2.URL.Path = rest
+	r2.URL.RawPath = ""
 	r2.RequestURI = rest
 
-	s.reverseProxyMulti(t, port).ServeHTTP(w, r2)
+	s.reverseProxyMulti(t, port, r.Host).ServeHTTP(w, r2)
 }
 
 // reverseProxyMulti builds a proxy for a multi tunnel that opens a stream
-// tagged with the target local port.
-func (s *Server) reverseProxyMulti(t *Tunnel, targetPort int) *httputil.ReverseProxy {
+// tagged with the target local port. reqHost is the Host header the browser
+// used, needed to rewrite same-host absolute URLs in responses.
+func (s *Server) reverseProxyMulti(t *Tunnel, targetPort int, reqHost string) *httputil.ReverseProxy {
 	tunnelID := t.ID
+	prefix := "/" + strconv.Itoa(targetPort)
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(rp *httputil.ProxyRequest) {
 			rp.SetURL(&url.URL{Scheme: "http", Host: "aritun-upstream"})
 			rp.Out.Host = rp.In.Host
 			rp.SetXForwarded()
+			// Let the transport negotiate (and transparently decode) gzip so
+			// the response body below is plain text we can rewrite.
+			rp.Out.Header.Del("Accept-Encoding")
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			rewriteMultiResponse(resp, prefix, reqHost)
+			return nil
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
