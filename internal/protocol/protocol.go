@@ -23,6 +23,9 @@ const Version = "0.1.0"
 const (
 	StreamControl byte = 0x01 // JSON messages, both directions
 	StreamData    byte = 0x02 // one proxied TCP connection
+	// StreamMulti is a proxied HTTP connection for a multi tunnel; the target
+	// local port follows the id as a 2-byte big-endian integer.
+	StreamMulti byte = 0x03
 )
 
 // Operations exchanged on the control channel.
@@ -42,6 +45,9 @@ const (
 const (
 	TypeHTTP = "http"
 	TypeTCP  = "tcp"
+	// TypeMulti is an HTTP tunnel that routes by the first path segment:
+	// /20128/foo -> the client's port 20128, path /foo.
+	TypeMulti = "multi"
 )
 
 // maxMessageSize bounds a single control message so a hostile peer cannot make
@@ -152,4 +158,45 @@ func ReadStreamHeader(r io.Reader) (byte, string, error) {
 		return 0, "", err
 	}
 	return hdr[0], string(id), nil
+}
+
+// WriteMultiStreamHeader tags a multi-tunnel data stream: [1-byte kind=0x03]
+// [2-byte id length][id][2-byte target port].
+func WriteMultiStreamHeader(w io.Writer, id string, targetPort int) error {
+	if len(id) > 1<<16-1 {
+		return errors.New("protocol: id too long")
+	}
+	buf := make([]byte, 5+len(id))
+	buf[0] = StreamMulti
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(id)))
+	copy(buf[3:], id)
+	binary.BigEndian.PutUint16(buf[3+len(id):], uint16(targetPort))
+	_, err := w.Write(buf)
+	return err
+}
+
+// ReadMultiStreamHeader reads a multi stream header and returns the tunnel id
+// and target local port.
+func ReadMultiStreamHeader(r io.Reader) (string, int, error) {
+	var hdr [3]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", 0, err
+	}
+	if hdr[0] != StreamMulti {
+		return "", 0, fmt.Errorf("protocol: expected multi stream, got kind %d", hdr[0])
+	}
+	n := binary.BigEndian.Uint16(hdr[1:3])
+	if n == 0 {
+		return "", 0, errors.New("protocol: empty stream id")
+	}
+	id := make([]byte, n)
+	if _, err := io.ReadFull(r, id); err != nil {
+		return "", 0, err
+	}
+	var portBuf [2]byte
+	if _, err := io.ReadFull(r, portBuf[:]); err != nil {
+		return "", 0, err
+	}
+	port := int(binary.BigEndian.Uint16(portBuf[:]))
+	return string(id), port, nil
 }

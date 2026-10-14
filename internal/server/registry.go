@@ -45,7 +45,7 @@ func (r *Registry) Add(t *Tunnel) error {
 	if _, dup := r.byID[t.ID]; dup {
 		return fmt.Errorf("tunnel %s already registered", t.ID)
 	}
-	if t.Type == protocol.TypeHTTP {
+	if t.Type == protocol.TypeHTTP || t.Type == protocol.TypeMulti {
 		t.Subdomain = strings.ToLower(t.Subdomain)
 		if err := ValidSubdomain(t.Subdomain); err != nil {
 			return err
@@ -64,7 +64,7 @@ func (r *Registry) Add(t *Tunnel) error {
 	}
 
 	r.byID[t.ID] = t
-	if t.Type == protocol.TypeHTTP {
+	if t.Type == protocol.TypeHTTP || t.Type == protocol.TypeMulti {
 		r.bySubdomain[t.Subdomain] = t
 	}
 	if t.Type == protocol.TypeTCP {

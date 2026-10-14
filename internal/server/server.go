@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -316,6 +317,12 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Multi tunnel: /20128/foo -> local port 20128, path /foo
+	if t.Type == protocol.TypeMulti {
+		s.handleMultiHTTP(w, r, t)
+		return
+	}
+
 	if t.BasicAuth != "" {
 		user, pass, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(user+":"+pass), []byte(t.BasicAuth)) != 1 {
@@ -326,6 +333,71 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.reverseProxy(t).ServeHTTP(w, r)
+}
+
+// handleMultiHTTP routes by the first path segment: /20128/api -> local port 20128, path /api.
+func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunnel) {
+	path := r.URL.Path
+	// extract port from first segment
+	seg := path
+	rest := "/"
+	if i := strings.IndexByte(path[1:], '/'); i >= 0 {
+		seg = path[1 : 1+i]
+		rest = path[1+i:]
+	} else {
+		seg = path[1:]
+	}
+	port, err := strconv.Atoi(seg)
+	if err != nil || port < 1 || port > 65535 {
+		http.Error(w, "usage: /<port>/<path>", http.StatusBadRequest)
+		return
+	}
+
+	// rewrite path (strip the port segment)
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = rest
+	r2.RequestURI = rest
+
+	s.reverseProxyMulti(t, port).ServeHTTP(w, r2)
+}
+
+// reverseProxyMulti builds a proxy for a multi tunnel that opens a stream
+// tagged with the target local port.
+func (s *Server) reverseProxyMulti(t *Tunnel, targetPort int) *httputil.ReverseProxy {
+	tunnelID := t.ID
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(rp *httputil.ProxyRequest) {
+			rp.SetURL(&url.URL{Scheme: "http", Host: "aritun-upstream"})
+			rp.Out.Host = rp.In.Host
+			rp.SetXForwarded()
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return s.openMultiStream(tunnelID, targetPort)
+			},
+			ForceAttemptHTTP2:     false,
+			ResponseHeaderTimeout: 0,
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			s.log.Debug("multi proxy error", "tunnel", tunnelID, "port", targetPort, "err", err)
+			if errors.Is(err, yamux.ErrSessionShutdown) || strings.Contains(err.Error(), "goAway") {
+				http.Error(w, "tunnel is offline", http.StatusBadGateway)
+				return
+			}
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+	return proxy
+}
+
+// openMultiStream asks the owning client for a fresh data stream with a target port.
+func (s *Server) openMultiStream(tunnelID string, targetPort int) (net.Conn, error) {
+	t := s.reg.ByID(tunnelID)
+	if t == nil {
+		return nil, fmt.Errorf("tunnel %s is not registered", tunnelID)
+	}
+	return t.Session.openMultiStream(tunnelID, targetPort)
 }
 
 // reverseProxy builds a one-shot proxy bound to a single tunnel. Each request

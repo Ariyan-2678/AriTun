@@ -1,6 +1,6 @@
 {
   "name": "aritun-server",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "AriTun server — self-hosted tunnel server (self-hosted ngrok alternative)",
   "license": "MIT",
   "repository": {
@@ -18,5 +18,6 @@
   },
   "files": ["bin/aritund.js", "postinstall.js", "launch.js", "README.md"]
 }
+
 
 

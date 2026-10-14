@@ -136,7 +136,7 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 		t := &Tunnel{Tunnel: out, Session: s}
 
 		switch req.Type {
-		case protocol.TypeHTTP:
+		case protocol.TypeHTTP, protocol.TypeMulti:
 			if req.Subdomain == "" {
 				out.Error = "subdomain required"
 				break
@@ -220,6 +220,27 @@ func (s *Session) openStream(tunnelID string) (net.Conn, error) {
 		return nil, err
 	}
 	if err := protocol.WriteStreamHeader(st, protocol.StreamData, tunnelID); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// openMultiStream opens a data stream tagged with tunnelID and a target local port.
+func (s *Session) openMultiStream(tunnelID string, targetPort int) (net.Conn, error) {
+	select {
+	case <-s.done:
+		return nil, errors.New("client session is closed")
+	default:
+	}
+	if s.sess == nil || s.sess.IsClosed() {
+		return nil, errors.New("client session is closed")
+	}
+	st, err := s.sess.Open()
+	if err != nil {
+		return nil, err
+	}
+	if err := protocol.WriteMultiStreamHeader(st, tunnelID, targetPort); err != nil {
 		st.Close()
 		return nil, err
 	}

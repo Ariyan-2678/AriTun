@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -374,27 +376,84 @@ func (c *Client) localPortFor(id string) int {
 func (c *Client) handleData(st net.Conn) {
 	defer st.Close()
 
-	kind, id, err := protocol.ReadStreamHeader(st)
-	if err != nil {
-		return
-	}
-	if kind != protocol.StreamData {
-		return
-	}
-	port := c.localPortFor(id)
-	if port == 0 {
-		c.log.Debug("stream for unknown tunnel", "id", id)
+	// Peek the first byte to distinguish StreamData from StreamMulti.
+	var kindBuf [1]byte
+	if _, err := io.ReadFull(st, kindBuf[:]); err != nil {
 		return
 	}
 
+	if kindBuf[0] == protocol.StreamMulti {
+		// Read the rest of the multi header: [2-byte id len][id][2-byte port]
+		c.handleMultiData(st)
+		return
+	}
+
+	// StreamData: read [2-byte id len][id] and dispatch.
+	// We already consumed the kind byte; reconstruct the header manually.
+	rest, err := readStreamID(st)
+	if err != nil {
+		return
+	}
+	port := c.localPortFor(rest)
+	if port == 0 {
+		c.log.Debug("stream for unknown tunnel", "id", rest)
+		return
+	}
+	c.dialLocalAndPipe(st, port)
+}
+
+// handleMultiData reads a StreamMulti header and pipes to the target port.
+func (c *Client) handleMultiData(st net.Conn) {
+	// [2-byte id len][id][2-byte port]
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(st, lenBuf[:]); err != nil {
+		return
+	}
+	idLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if idLen == 0 || idLen > 1<<16-1 {
+		return
+	}
+	id := make([]byte, idLen)
+	if _, err := io.ReadFull(st, id); err != nil {
+		return
+	}
+	var portBuf [2]byte
+	if _, err := io.ReadFull(st, portBuf[:]); err != nil {
+		return
+	}
+	port := int(binary.BigEndian.Uint16(portBuf[:]))
+	if port < 1 || port > 65535 {
+		return
+	}
+	c.dialLocalAndPipe(st, port)
+}
+
+// dialLocalAndPipe connects to localhost:port and pipes both ways.
+func (c *Client) dialLocalAndPipe(st net.Conn, port int) {
 	local, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.cfg.LocalHost, port), 5*time.Second)
 	if err != nil {
 		c.log.Warn("cannot reach local service", "port", port, "err", err)
 		return
 	}
 	defer local.Close()
-
 	protocol.Pipe(st, local)
+}
+
+// readStreamID reads [2-byte id len][id] from the stream (kind already consumed).
+func readStreamID(r io.Reader) (string, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return "", err
+	}
+	n := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if n == 0 || n > 1<<16-1 {
+		return "", errors.New("bad stream id length")
+	}
+	id := make([]byte, n)
+	if _, err := io.ReadFull(r, id); err != nil {
+		return "", err
+	}
+	return string(id), nil
 }
 
 // ---- dialing ----

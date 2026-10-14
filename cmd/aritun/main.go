@@ -225,7 +225,7 @@ func cmdHTTP(args []string) error {
 }
 
 // cmdHTTPAll implements `aritun http all`: discover local web ports and
-// publish each as an HTTP tunnel with a p<port> subdomain.
+// publish them behind a single multi tunnel, e.g. /20128 -> localhost:20128.
 func cmdHTTPAll(args []string) error {
 	var g globals
 	fs := flag.NewFlagSet("http all", flag.ContinueOnError)
@@ -257,13 +257,13 @@ func cmdHTTPAll(args []string) error {
 		return fmt.Errorf("no listening TCP ports found on this machine")
 	}
 
-	var tunnels []protocol.Tunnel
-	for _, p := range found {
-		tunnels = append(tunnels, protocol.Tunnel{
-			Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
-		})
-	}
-	return serve(&g, tunnels)
+	// Single multi tunnel: one subdomain, routes by /<port>/ path.
+	sub := client.RandomSubdomain()
+	tunnels := []protocol.Tunnel{{
+		Type:      protocol.TypeMulti,
+		Subdomain: sub,
+	}}
+	return serveWithPorts(&g, tunnels, found)
 }
 
 func cmdTCP(args []string) error {
@@ -402,6 +402,12 @@ func cmdAll(args []string) error {
 // serve wires up a client, prints the ngrok-style banner, and blocks until the
 // user interrupts.
 func serve(g *globals, tunnels []protocol.Tunnel) error {
+	return serveWithPorts(g, tunnels, nil)
+}
+
+// serveWithPorts is like serve but for multi tunnels: ports is the list of
+// local ports served through the multi tunnel.
+func serveWithPorts(g *globals, tunnels []protocol.Tunnel, ports []int) error {
 	if g.server == "" {
 		return fmt.Errorf("--server is required (or set ARITUN_SERVER)")
 	}
@@ -417,7 +423,7 @@ func serve(g *globals, tunnels []protocol.Tunnel) error {
 
 	printed := false
 	c.OnUpdate(func(active []protocol.Tunnel) {
-		printBanner(active, printed)
+		printBannerMulti(active, ports, printed)
 		printed = true
 	})
 
@@ -466,9 +472,38 @@ func printBanner(tunnels []protocol.Tunnel, reconnect bool) {
 		if t.Type == protocol.TypeTCP {
 			label = fmt.Sprintf("tcp port %d", t.PublicPort)
 		}
-		fmt.Printf("  %-*s  ->  %s\n", width, label, local)
+		fmt.Printf("  %-40s  ->  %s\n", label, local)
 	}
 	fmt.Printf("\n%d AriTun forwarding rule(s) live. Press Ctrl+C to stop.\n", len(sorted))
+}
+
+// printBannerMulti prints the multi-tunnel banner: one base URL plus a table
+// of port -> path mappings.
+func printBannerMulti(tunnels []protocol.Tunnel, ports []int, reconnect bool) {
+	if reconnect {
+		fmt.Fprintf(os.Stderr, "\n-- reconnected --\n")
+	}
+	if len(tunnels) == 0 {
+		fmt.Fprintln(os.Stderr, "no tunnels published")
+		return
+	}
+
+	for _, t := range tunnels {
+		if t.Type == protocol.TypeMulti && t.PublicURL != "" {
+			fmt.Printf("  %s\n", t.PublicURL)
+			break
+		}
+	}
+
+	if len(ports) > 0 {
+		sort.Ints(ports)
+		fmt.Println()
+		for _, p := range ports {
+			fmt.Printf("  /%-6d  ->  http://localhost:%d\n", p, p)
+		}
+	}
+
+	fmt.Printf("\n%d port(s) live. Press Ctrl+C to stop.\n", len(ports))
 }
 
 func describe(t protocol.Tunnel) string {
