@@ -233,7 +233,6 @@ func cmdHTTPAll(args []string) error {
 	excludeFlag := fs.String("exclude", "", "comma separated ports to skip")
 	includeEphemeral := fs.Bool("include-ephemeral", false,
 		"also publish high-numbered dynamic ports")
-	httpPortsFlag := fs.String("http-ports", "", "extra ports to treat as web services")
 	g.register(fs)
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
 		return err
@@ -249,8 +248,6 @@ func cmdHTTPAll(args []string) error {
 		opts.Ports = ports
 	}
 
-	extraWeb := parseIntSet(*httpPortsFlag)
-
 	fmt.Fprintln(os.Stderr, "scanning local listeners...")
 	found, err := client.DiscoverLocalPorts(opts)
 	if err != nil {
@@ -262,14 +259,9 @@ func cmdHTTPAll(args []string) error {
 
 	var tunnels []protocol.Tunnel
 	for _, p := range found {
-		if client.LooksLikeWeb(p, extraWeb) {
-			tunnels = append(tunnels, protocol.Tunnel{
-				Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
-			})
-		}
-	}
-	if len(tunnels) == 0 {
-		return fmt.Errorf("no web ports found (%d ports scanned); try --http-ports or --include-ephemeral", len(found))
+		tunnels = append(tunnels, protocol.Tunnel{
+			Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
+		})
 	}
 	return serve(&g, tunnels)
 }
