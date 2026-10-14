@@ -1,8 +1,10 @@
-# AriTun — راه‌اندازی و استفاده
+# AriTun — Setup & Usage
 
-## ۱ — انتخاب و ساخت باینری
+**Languages:** English | [فارسی](SETUP.fa.md)
 
-| سیستم مقصد | باینری سرور | باینری کلاینت |
+## 1 — Choose and build binaries
+
+| Target | Server binary | Client binary |
 |---|---|---|
 | Linux amd64 | `dist/aritund-linux-amd64` | `dist/aritun-linux-amd64` |
 | Linux arm64 | `dist/aritund-linux-arm64` | `dist/aritun-linux-arm64` |
@@ -10,28 +12,28 @@
 | Windows arm64 | `dist/aritund-windows-arm64.exe` | `dist/aritun-windows-arm64.exe` |
 | macOS amd64 / arm64 | `dist/aritund-darwin-*` | `dist/aritun-darwin-*` |
 
-با Go نصب‌شده، از ریشه‌ی پروژه:
+With Go installed, from the project root:
 
 ```bash
 ./build.sh              # Linux server + Windows/Linux clients
-./build.sh all          # هر شش سیستم/معماری
-./build.sh linux/arm64  # فقط یک target
+./build.sh all          # all six platform/arch combinations
+./build.sh linux/arm64  # a single target
 ```
 
-## ۲ — دامنه و DNS
+## 2 — Domain and DNS
 
-در DNS این دو رکورد را به IP سرور بده؛ در Cloudflare روی **DNS only** بگذار:
+Point these two records at the server IP. In Cloudflare, keep them **DNS only**:
 
-| نوع | نام | مقدار |
+| Type | Name | Value |
 |---|---|---|
 | A | `aritun` | `<SERVER_IP>` |
 | A | `*.aritun` | `<SERVER_IP>` |
 
-در مثال‌های این راهنما `aritun.yourdomain.com` را با دامنه‌ی خودت عوض کن.
+In the examples below, replace `aritun.yourdomain.com` with your own domain.
 
-## ۳ — Caddy با TLS wildcard
+## 3 — Caddy with wildcard TLS
 
-Wildcard certificate با DNS-01 ساخته می‌شود. Caddy را با هر دو addon بساز و نسخه را pin کن:
+The wildcard certificate is obtained via DNS-01. Build Caddy with both addons and pin the version:
 
 ```bash
 CGO_ENABLED=0 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
@@ -43,16 +45,16 @@ sudo install -m755 caddy /usr/local/bin/caddy
 sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/caddy
 ```
 
-هر دو addon لازم‌اند: Cloudflare provider به‌تنهایی کافی نیست؛ `caddytls` لازم است تا Caddyfile adapter، DNS challenge را درست بارگذاری کند. توکن Cloudflare را به `Zone / DNS / Edit` در همان zone محدود کن و در فایل Caddyfile نچسبان.
+Both addons are required: the Cloudflare provider alone is not enough — `caddytls` is needed so the Caddyfile adapter loads the DNS challenge correctly. Scope the Cloudflare token to `Zone / DNS / Edit` on the same zone, and do not paste it into a file.
 
 ```bash
 sudo cp Caddyfile.example /etc/caddy/Caddyfile
 sudo sed -i "s|aritun\\.yourdomain\\.com|${DOMAIN}|g; s|YOUR_CLOUDFLARE_API_TOKEN|${CLOUDFLARE_API_TOKEN}|g" /etc/caddy/Caddyfile
 ```
 
-Caddyfile نمونه فقط `${DOMAIN}` و `*.${DOMAIN}` را به `127.0.0.1:9001` می‌فرستد.
+The example Caddyfile only forwards `${DOMAIN}` and `*.${DOMAIN}` to `127.0.0.1:9001`.
 
-برای سرویس systemd از [`install/caddy.service`](install/caddy.service) استفاده کن. Caddy به `HOME` و storage قابل‌نوشتن برای کاربر `caddy` نیاز دارد و برای bind به پورت‌های ۸۰/۴۴۳ باید capability داشته باشد:
+Use the systemd unit at [`install/caddy.service`](install/caddy.service). Caddy needs a writable `HOME` and storage for the `caddy` user, plus the capability to bind ports 80/443:
 
 ```bash
 sudo chown -R caddy:caddy /var/lib/caddy
@@ -62,7 +64,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now caddy
 ```
 
-## ۴ — نصب سرور AriTun
+## 4 — Install the AriTun server
 
 ```bash
 sudo useradd -r -M -s /usr/sbin/nologin aritun 2>/dev/null || true
@@ -74,13 +76,13 @@ sudo chown root:aritun /etc/aritun/token
 sudo chmod 0640 /etc/aritun/token
 ```
 
-سرویس template را نصب کن:
+Install the service template:
 
 ```bash
 sudo cp install/aritund.service /etc/systemd/system/aritund.service
 ```
 
-`ARITUN_DOMAIN` را با دامنه‌ی خودت تنظیم کن. اگر clients با public IP وصل می‌شوند، آن IP را در `ARITUN_CONTROL_HOSTS` اضافه کن تا SAN گواهی کنترل آن را پوشش دهد. سپس:
+Set `ARITUN_DOMAIN` to your domain. If clients connect from a public IP, add that IP to `ARITUN_CONTROL_HOSTS` so the control certificate's SAN covers it. Then:
 
 ```bash
 sudo systemctl daemon-reload
@@ -89,7 +91,7 @@ sudo systemctl status aritund
 sudo journalctl -u aritund -n 30 --no-pager
 ```
 
-فایروال:
+Firewall:
 
 ```bash
 sudo ufw allow 80/tcp
@@ -97,23 +99,23 @@ sudo ufw allow 443/tcp
 sudo ufw allow 20000:20999/tcp
 ```
 
-پورت‌های `9001` و `9090` فقط روی loopback بمانند؛ مستقیم به اینترنت بازشان نکن.
+Keep ports `9001` and `9090` bound to loopback; never expose them directly to the internet.
 
-## ۵ — تنظیم Windows client
+## 5 — Configure the Windows client
 
-PowerShell؛ بعد از `setx` یک ترمینال تازه باز کن:
+PowerShell — open a fresh terminal after `setx`:
 
 ```powershell
 setx ARITUN_SERVER "wss://aritun.yourdomain.com/control"
-setx ARITUN_TOKEN "<توکن سرور>"
+setx ARITUN_TOKEN "<server token>"
 setx ARITUN_PROXY "socks5://127.0.0.1:10808"
 ```
 
-Caddy با Let’s Encrypt گواهی عمومی می‌دهد، پس `ARITUN_CA` را تنظیم نکن. اگر از self-signed certificate استفاده می‌کنی، فقط آن‌وقت مسیر PEM را در `ARITUN_CA` قرار بده.
+Caddy issues public certificates via Let's Encrypt, so do not set `ARITUN_CA`. Only set `ARITUN_CA` to a PEM path if you use a self-signed certificate.
 
-## ۶ — استفاده
+## 6 — Usage
 
-در PowerShell از پوشه‌ی `dist`:
+In PowerShell, from the `dist` folder:
 
 ```powershell
 .\aritun-windows-amd64.exe http 3000
@@ -123,11 +125,11 @@ Caddy با Let’s Encrypt گواهی عمومی می‌دهد، پس `ARITUN_CA
 .\aritun-windows-amd64.exe status
 ```
 
-- `http <port>` یک HTTPS URL می‌دهد.
-- `tcp <port>` یک public TCP port از محدوده‌ی تنظیم‌شده در سرور می‌گیرد.
-- `all` listenerها را پیدا می‌کند؛ proxy/server ports و پورت‌های حساس را حذف می‌کند. قبل از انتشار همه‌ی سرویس‌ها، پورت‌ها را محدود و بازبینی کن.
+- `http <port>` gives you an HTTPS URL.
+- `tcp <port>` gets a public TCP port from the range configured on the server.
+- `all` finds listeners; it excludes proxy/server ports and sensitive ports. Narrow and review the list before publishing everything.
 
-## ۷ — تست و توسعه
+## 7 — Tests and development
 
 ```bash
 go test ./...
@@ -136,8 +138,8 @@ go vet ./...
 ./test/smoke_tls_all.sh
 ```
 
-برای تست محلی بدون TLS، `aritund --control-addr 127.0.0.1:9000 --control-tls=false --token dev` را اجرا کن؛ بعد یک سرویس محلی و `aritun http 3000 --server 127.0.0.1:9000 --token dev --no-tls` را اجرا کن.
+For local testing without TLS, run `aritund --control-addr 127.0.0.1:9000 --control-tls=false --token dev`; then start a local service and `aritun http 3000 --server 127.0.0.1:9000 --token dev --no-tls`.
 
-## ۸ — GitHub
+## 8 — GitHub
 
-مخزن: `https://github.com/Ariyan-2678/aritun`
+Repository: `https://github.com/Ariyan-2678/aritun`

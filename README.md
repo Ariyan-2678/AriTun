@@ -1,5 +1,7 @@
 # AriTun
 
+**Languages:** English | [فارسی](README.fa.md)
+
 AriTun is a self-hosted way to expose local services from behind NAT — like ngrok, but on your own server.
 
 ```text
@@ -48,7 +50,7 @@ setx ARITUN_PROXY "socks5://127.0.0.1:10808"   # optional
 aritun http 3000
 ```
 
-Full setup guide: [SETUP.md](SETUP.md)
+Full setup guide: [SETUP.md](SETUP.md) ([فارسی](SETUP.fa.md))
 
 ## Architecture
 
