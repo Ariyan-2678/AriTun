@@ -50,6 +50,31 @@ type TokenRecord struct {
 	Token       string    `json:"token"`
 	Permissions []string  `json:"permissions"`
 	CreatedAt   time.Time `json:"created_at"`
+	// ExpiresAt is when the token stops working. Nil means it never expires.
+	// Expired records stay in tokens.json (visible to List) but lookup
+	// rejects them, so checkToken/resolveToken need no expiry logic.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// expired reports whether the token's TTL has elapsed.
+func (r *TokenRecord) expired() bool {
+	return r.ExpiresAt != nil && !time.Now().Before(*r.ExpiresAt)
+}
+
+// defaultTokenTTL is the lifetime newTokenStore stamps onto freshly created
+// (and rotated) tokens. Set with SetDefaultTokenTTL before server.New.
+var (
+	defaultTTLMu    sync.RWMutex
+	defaultTokenTTL time.Duration
+)
+
+// SetDefaultTokenTTL sets the lifetime applied to newly created named
+// tokens; zero means tokens never expire. Call it before server.New so the
+// token store picks it up at construction.
+func SetDefaultTokenTTL(d time.Duration) {
+	defaultTTLMu.Lock()
+	defaultTokenTTL = d
+	defaultTTLMu.Unlock()
 }
 
 // tokenStore is a file-backed list of named tokens with per-type permissions.
@@ -60,10 +85,16 @@ type tokenStore struct {
 	mu      sync.RWMutex
 	path    string
 	records map[string]*TokenRecord // keyed by token value
+	// defaultTTL is applied by Add (and rotate) when > 0; zero means
+	// tokens never expire.
+	defaultTTL time.Duration
 }
 
 func newTokenStore(path string) *tokenStore {
 	ts := &tokenStore{path: path, records: make(map[string]*TokenRecord)}
+	defaultTTLMu.RLock()
+	ts.defaultTTL = defaultTokenTTL
+	defaultTTLMu.RUnlock()
 	ts.load()
 	return ts
 }
@@ -108,7 +139,9 @@ func (ts *tokenStore) save() error {
 	return os.WriteFile(ts.path, b, 0o600)
 }
 
-// Add persists a new token and returns the generated secret.
+// Add persists a new token and returns the generated secret. When the
+// store's defaultTTL is positive the token expires that long after
+// creation.
 func (ts *tokenStore) Add(name string, perms []string) (string, error) {
 	if name == "" {
 		return "", errors.New("token name required")
@@ -120,14 +153,20 @@ func (ts *tokenStore) Add(name string, perms []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	ts.records[secret] = &TokenRecord{
+	now := time.Now()
+	rec := &TokenRecord{
 		Name:        name,
 		Token:       secret,
 		Permissions: perms,
-		CreatedAt:   time.Now(),
+		CreatedAt:   now,
 	}
+	if ttl := ts.defaultTTL; ttl > 0 {
+		exp := now.Add(ttl)
+		rec.ExpiresAt = &exp
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.records[secret] = rec
 	return secret, ts.save()
 }
 
@@ -172,7 +211,59 @@ func (ts *tokenStore) List() []TokenRecord {
 	return out
 }
 
-// lookup finds the record for a secret in constant time.
+// rotate issues a fresh secret for every token registered under name and
+// revokes the old secret(s). Permissions and CreatedAt are preserved. When
+// the store's defaultTTL is positive the new secret gets a fresh expiry
+// (so rotate doubles as "renew"); otherwise the previous expiry, if any,
+// is kept. The change is persisted like every other mutation.
+func (ts *tokenStore) rotate(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("token name required")
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	var proto *TokenRecord
+	for _, r := range ts.records {
+		if r.Name == name {
+			// Keep the newest record's permissions/expiry as the template.
+			if proto == nil || r.CreatedAt.After(proto.CreatedAt) {
+				proto = r
+			}
+		}
+	}
+	if proto == nil {
+		return "", fmt.Errorf("token %q not found", name)
+	}
+	secret, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	for k, r := range ts.records {
+		if r.Name == name {
+			delete(ts.records, k)
+		}
+	}
+	var exp *time.Time
+	if ttl := ts.defaultTTL; ttl > 0 {
+		now := time.Now()
+		e := now.Add(ttl)
+		exp = &e
+	} else {
+		exp = proto.ExpiresAt
+	}
+	ts.records[secret] = &TokenRecord{
+		Name:        name,
+		Token:       secret,
+		Permissions: append([]string(nil), proto.Permissions...),
+		CreatedAt:   proto.CreatedAt,
+		ExpiresAt:   exp,
+	}
+	return secret, ts.save()
+}
+
+// lookup finds the record for a secret in constant time. Expired tokens
+// are treated as absent, so callers (checkToken, resolveToken) reject them
+// without any expiry logic of their own.
 func (ts *tokenStore) lookup(secret string) *TokenRecord {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
@@ -184,16 +275,19 @@ func (ts *tokenStore) lookup(secret string) *TokenRecord {
 			found = rec
 		}
 	}
+	if found != nil && found.expired() {
+		return nil
+	}
 	return found
 }
 
 func validatePerms(perms []string) error {
 	if len(perms) == 0 {
-		return fmt.Errorf("at least one permission required (%s, %s, %s, or *)", PermHTTP, PermTCP, PermMulti)
+		return fmt.Errorf("at least one permission required (%s, %s, %s, %s, or *)", PermHTTP, PermTCP, PermMulti, PermUDP)
 	}
 	for _, p := range perms {
 		switch p {
-		case PermHTTP, PermTCP, PermMulti, "*":
+		case PermHTTP, PermTCP, PermMulti, PermUDP, "*":
 		default:
 			return fmt.Errorf("unknown permission %q", p)
 		}

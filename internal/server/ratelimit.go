@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -151,4 +152,135 @@ func (c *limitedConn) Write(p []byte) (int, error) {
 		p = p[n:]
 	}
 	return written, nil
+}
+
+// ---- admin API limiter ----
+
+// Defaults for the admin HTTP surface. The admin binds loopback by default,
+// but it may be exposed (behind Caddy or directly), so every admin route is
+// also rate limited per client IP as defense in depth. The numbers are named
+// constants so tests can tighten them.
+const (
+	// adminRatePerSec is the sustained request rate allowed per client IP.
+	// A few hundred requests per minute is far more than a single operator
+	// (or the dashboard's own refresh polls) will ever need.
+	adminRatePerSec = 10 // ~600 requests/minute
+	// adminRateBurst is the immediate burst allowed per client IP, so a
+	// page load or a status script can fire a handful of calls at once.
+	adminRateBurst = 120
+	// adminMaxClients bounds the per-IP table; past this many tracked
+	// addresses the least-recently-seen ones are evicted.
+	adminMaxClients = 4096
+	// adminClientTTL forgets an idle client IP. Its bucket would have
+	// refilled to full long before, so nothing is gained by keeping it.
+	adminClientTTL = 5 * time.Minute
+	// adminGCInterval is the minimum spacing between table sweeps.
+	adminGCInterval = 30 * time.Second
+	// adminGCTrigger forces a sweep once the table grows this large.
+	adminGCTrigger = 512
+)
+
+// adminBucket is one client IP's token bucket inside an adminLimiter.
+type adminBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// adminLimiter is a per-client-IP token bucket for the admin surface. A nil
+// *adminLimiter allows everything, and setLimit lets tests tighten the rate
+// and burst at runtime.
+type adminLimiter struct {
+	mu      sync.Mutex
+	rate    float64 // tokens (requests) per second
+	burst   float64
+	clients map[string]*adminBucket
+	lastGC  time.Time
+}
+
+// newAdminLimiter builds a limiter allowing perSec requests/second (burst)
+// per client IP. A non-positive perSec means unlimited (nil).
+func newAdminLimiter(perSec, burst int) *adminLimiter {
+	if perSec <= 0 {
+		return nil // unlimited
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return &adminLimiter{
+		rate:    float64(perSec),
+		burst:   float64(burst),
+		clients: make(map[string]*adminBucket),
+	}
+}
+
+// setLimit replaces the rate and burst at runtime. All future allow decisions
+// — for existing and new buckets alike — use the new numbers.
+func (l *adminLimiter) setLimit(perSec, burst int) {
+	if l == nil || perSec <= 0 {
+		return
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	l.mu.Lock()
+	l.rate, l.burst = float64(perSec), float64(burst)
+	l.mu.Unlock()
+}
+
+// allow takes one request token for ip, refilling its bucket from the elapsed
+// time. It returns false when the caller should answer 429.
+func (l *adminLimiter) allow(ip string) bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	l.gc(now)
+	b, ok := l.clients[ip]
+	if !ok {
+		b = &adminBucket{tokens: l.burst, last: now}
+		l.clients[ip] = b
+	} else {
+		b.tokens += now.Sub(b.last).Seconds() * l.rate
+		b.last = now
+	}
+	if b.tokens > l.burst {
+		b.tokens = l.burst
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// gc drops idle buckets and, past adminMaxClients, evicts the
+// least-recently-seen addresses so the table stays memory-bounded no matter
+// how many source addresses are thrown at it.
+func (l *adminLimiter) gc(now time.Time) {
+	if len(l.clients) < adminGCTrigger && now.Sub(l.lastGC) < adminGCInterval {
+		return
+	}
+	l.lastGC = now
+	for ip, b := range l.clients {
+		if now.Sub(b.last) > adminClientTTL {
+			delete(l.clients, ip)
+		}
+	}
+	if len(l.clients) <= adminMaxClients {
+		return
+	}
+	type seen struct {
+		ip   string
+		last time.Time
+	}
+	seenList := make([]seen, 0, len(l.clients))
+	for ip, b := range l.clients {
+		seenList = append(seenList, seen{ip, b.last})
+	}
+	sort.Slice(seenList, func(i, j int) bool { return seenList[i].last.Before(seenList[j].last) })
+	for _, s := range seenList[:len(l.clients)-adminMaxClients] {
+		delete(l.clients, s.ip)
+	}
 }

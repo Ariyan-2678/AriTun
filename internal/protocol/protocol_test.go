@@ -9,7 +9,7 @@ func TestDatagramRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	payloads := [][]byte{
 		[]byte("hello"),
-		{}, // empty datagram is legal
+		{},                               // empty datagram is legal
 		bytes.Repeat([]byte{0xAB}, 1400), // typical MTU-sized payload
 	}
 	for _, p := range payloads {

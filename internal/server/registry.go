@@ -48,6 +48,11 @@ type Registry struct {
 	byID         map[string]*Tunnel
 	bySubdomain  map[string]*Tunnel
 	byPublicPort map[int]*Tunnel
+
+	// persist holds the on-disk tunnel reservations (see persist.go). It is
+	// installed once at startup by loadPersisted and is nil until then, which
+	// disables persistence entirely.
+	persist *persistStore
 }
 
 func newRegistry() *Registry {
@@ -96,13 +101,31 @@ func (r *Registry) Add(t *Tunnel) error {
 	return nil
 }
 
-// Remove deletes a tunnel and reports it.
+// setPersist installs the reservation store. Called once at startup by
+// loadPersisted, before any session is served.
+func (r *Registry) setPersist(p *persistStore) {
+	r.mu.Lock()
+	r.persist = p
+	r.mu.Unlock()
+}
+
+// persisted returns the reservation store, or nil when persistence is off.
+func (r *Registry) persisted() *persistStore {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.persist
+}
+
+// Remove deletes a tunnel and reports it. Deliberate removals (unregister,
+// failed-register rollback) drop the tunnel's reservation too; a plain client
+// disconnect goes through RemoveSession, which keeps it so the next reconnect
+// is re-awarded the same subdomain or port.
 func (r *Registry) Remove(id string) (*Tunnel, bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	t, ok := r.byID[id]
 	if !ok {
+		r.mu.Unlock()
 		return nil, false
 	}
 	delete(r.byID, id)
@@ -112,7 +135,28 @@ func (r *Registry) Remove(id string) (*Tunnel, bool) {
 	if t.PublicPort != 0 {
 		delete(r.byPublicPort, t.PublicPort)
 	}
+	r.mu.Unlock()
+
+	r.forgetPersist(t)
 	return t, true
+}
+
+// forgetPersist drops the tunnel's reservation, if persistence is on.
+func (r *Registry) forgetPersist(t *Tunnel) {
+	p := r.persisted()
+	if p == nil {
+		return
+	}
+	res := persistedTunnel{
+		Type:       t.Type,
+		Subdomain:  t.Subdomain,
+		PublicPort: t.PublicPort,
+		LocalPort:  t.LocalPort,
+	}
+	if t.Session != nil {
+		res.ClientName = t.Session.name
+	}
+	_ = p.remove(res)
 }
 
 // RemoveSession drops every tunnel owned by a session.
@@ -184,16 +228,18 @@ func (r *Registry) Count() int {
 }
 
 // portAllocator hands out public ports for tcp tunnels inside a configured
-// range, skipping anything already bound on this host.
+// range, skipping anything already bound on this host and anything reserved
+// for a persisted tunnel that has not reconnected yet.
 type portAllocator struct {
-	mu   sync.Mutex
-	next int
-	min  int
-	max  int
+	mu       sync.Mutex
+	next     int
+	min      int
+	max      int
+	reserved map[int]bool
 }
 
 func newPortAllocator(min, max int) *portAllocator {
-	return &portAllocator{next: min, min: min, max: max}
+	return &portAllocator{next: min, min: min, max: max, reserved: make(map[int]bool)}
 }
 
 // alloc reserves the next free port, verifying nothing is listening on it yet.
@@ -207,11 +253,39 @@ func (a *portAllocator) alloc() (int, error) {
 		if a.next > a.max {
 			a.next = a.min
 		}
+		if a.reserved[port] {
+			continue
+		}
 		if portFree(port) {
 			return port, nil
 		}
 	}
 	return 0, fmt.Errorf("no free ports left in range %d-%d", a.min, a.max)
+}
+
+// reserve marks a port as spoken for — a persisted tunnel will re-claim it on
+// reconnect — so alloc never hands it to a different tunnel. Ports outside
+// the configured range are ignored: they could never be handed out anyway.
+func (a *portAllocator) reserve(port int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if port >= a.min && port <= a.max {
+		a.reserved[port] = true
+	}
+}
+
+// unreserve releases a reservation; the port is owned by a live tunnel now.
+func (a *portAllocator) unreserve(port int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.reserved, port)
+}
+
+// isReserved reports whether port is currently reserved.
+func (a *portAllocator) isReserved(port int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reserved[port]
 }
 
 func portFree(port int) bool {

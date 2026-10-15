@@ -82,6 +82,9 @@ func startE2E(t *testing.T, cfg Config) *e2eEnv {
 		cfg.Token = e2eRootToken
 	}
 	cfg.ControlTLS = false
+	if cfg.DataDir == "" {
+		cfg.DataDir = t.TempDir()
+	}
 	srv := New(cfg, slog.New(slog.NewTextHandler(logs, nil)))
 
 	ctx, cancel := context.WithCancel(context.Background())

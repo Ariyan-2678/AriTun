@@ -179,15 +179,27 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 			// Fold case before building the public URL so the advertised
 			// link matches what the Host-header router will look up.
 			sub := strings.ToLower(req.Subdomain)
+			// A persisted reservation keeps the subdomain for its owning
+			// client across restarts; nobody else may take it meanwhile.
+			if s.srv.subdomainReservedFor(s.name, sub) {
+				out.Error = fmt.Sprintf("subdomain %q is reserved for another client", sub)
+				break
+			}
 			t.Subdomain = sub
 			t.PublicURL = s.publicURL(sub)
 			out = t.Tunnel
 
 		case protocol.TypeTCP:
-			port, err := s.srv.ports.alloc()
-			if err != nil {
-				out.Error = err.Error()
-				break
+			// A reconnecting client is re-awarded the public port reserved
+			// for its local port, so its public URL survives a restart.
+			port, claimed := s.srv.claimPersistedPort(protocol.TypeTCP, req.LocalPort)
+			if !claimed {
+				var err error
+				port, err = s.srv.ports.alloc()
+				if err != nil {
+					out.Error = err.Error()
+					break
+				}
 			}
 			t.PublicPort = port
 			out = t.Tunnel
@@ -220,13 +232,26 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 				out.Error = err.Error()
 			}
 		} else if t.Type == protocol.TypeUDP {
-			if err := s.srv.startUDPListener(t); err != nil {
+			// Like tcp, a re-awarded udp tunnel binds its reserved port
+			// instead of a freshly allocated one.
+			var err error
+			if port, claimed := s.srv.claimPersistedPort(protocol.TypeUDP, req.LocalPort); claimed {
+				err = s.srv.startUDPListenerPort(t, port)
+			} else {
+				err = s.srv.startUDPListener(t)
+			}
+			if err != nil {
 				s.srv.reg.Remove(t.ID)
 				out.Error = err.Error()
 			}
 		}
 
 		out = t.Tunnel
+		if out.Error == "" {
+			// Save the reservation now that the tunnel is fully up, so a
+			// restart re-awards this subdomain or port to the same client.
+			s.srv.persistTunnel(t)
+		}
 		s.srv.log.Info("tunnel published",
 			"client", s.name, "tunnel", t.ID, "type", t.Type,
 			"local", t.LocalPort, "url", t.PublicURL, "public_port", t.PublicPort)

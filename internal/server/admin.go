@@ -9,22 +9,29 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // serveAdmin exposes the dashboard and the JSON API used by `aritun status`.
+// Every route is wrapped in a per-client-IP rate limiter (defense in depth:
+// the admin binds loopback by default but may be exposed).
 func (s *Server) serveAdmin(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/tunnels", s.handleAPITunnels)
 	mux.HandleFunc("/api/requests", s.handleAPIRequests)
 	mux.HandleFunc("/api/tokens", s.handleAPITokens)
 	mux.HandleFunc("/api/audit", s.handleAPIAudit)
+	mux.HandleFunc("/api/bandwidth", s.handleAPIBandwidth)
 	mux.HandleFunc("/api/tunnels/", s.handleAPITunnelAction) // /api/tunnels/{id}/{pause|resume}
 	mux.HandleFunc("/metrics", s.renderMetrics)
 	mux.HandleFunc("/", s.handleDashboard)
 
+	// Keep the bandwidth chart's history ticking even when nobody is looking.
+	go s.bandwidthLoop(ctx)
+
 	srv := &http.Server{
-		Handler:           mux,
+		Handler:           s.limitAdmin(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -38,6 +45,170 @@ func (s *Server) serveAdmin(ctx context.Context, ln net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+// limitAdmin wraps the admin mux in the per-client-IP rate limiter. The
+// client IP comes from the socket address only — never from a header, which
+// a caller could spoof to escape the limiter. Over the limit answers a short
+// 429 with a Retry-After hint.
+func (s *Server) limitAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.adminLim.allow(adminClientIP(r.RemoteAddr)) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// adminClientIP extracts the host part of a "host:port" remote address.
+func adminClientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// ---- bandwidth sampler ----
+
+// Bandwidth sampling for the dashboard chart: the server keeps a bounded ring
+// of aggregate throughput samples — one per interval, or whenever new bytes
+// have moved since the last sample — and /api/bandwidth serves it.
+const (
+	// bandwidthInterval is the minimum spacing between samples.
+	bandwidthInterval = 5 * time.Second
+	// bandwidthRetention is how many samples the ring keeps (~10 minutes).
+	bandwidthRetention = 120
+)
+
+// bandwidthSample is one aggregate throughput data point: the bytes moved in
+// each direction since the previous sample.
+type bandwidthSample struct {
+	T        time.Time `json:"t"`
+	BytesIn  int64     `json:"bytes_in"`
+	BytesOut int64     `json:"bytes_out"`
+}
+
+// bandwidthSampler is a memory-bounded ring of bandwidthSamples.
+type bandwidthSampler struct {
+	mu       sync.Mutex
+	interval time.Duration
+	max      int
+	samples  []bandwidthSample
+	lastAt   time.Time
+	prevIn   int64 // aggregate counters as of the previous sample
+	prevOut  int64
+}
+
+func newBandwidthSampler(interval time.Duration, max int) *bandwidthSampler {
+	if interval <= 0 {
+		interval = bandwidthInterval
+	}
+	if max <= 0 {
+		max = bandwidthRetention
+	}
+	return &bandwidthSampler{interval: interval, max: max}
+}
+
+// append records the current aggregate totals. The stored sample is the delta
+// since the previous one; a shrink (a tunnel disconnecting and dropping its
+// lifetime totals out of the aggregate) is clamped to zero. A sample closer
+// to the previous one than the interval is dropped unless it carries new
+// bytes or force is set.
+func (b *bandwidthSampler) append(now time.Time, in, out int64, force bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	newBytes := in != b.prevIn || out != b.prevOut
+	if !force && !newBytes && !b.lastAt.IsZero() && now.Sub(b.lastAt) < b.interval {
+		return
+	}
+	din, dout := in-b.prevIn, out-b.prevOut
+	if din < 0 {
+		din = 0
+	}
+	if dout < 0 {
+		dout = 0
+	}
+	b.prevIn, b.prevOut = in, out
+	b.lastAt = now
+	if len(b.samples) >= b.max {
+		copy(b.samples, b.samples[1:])
+		b.samples = b.samples[:b.max-1]
+	}
+	b.samples = append(b.samples, bandwidthSample{T: now, BytesIn: din, BytesOut: dout})
+}
+
+// snapshot copies the ring, oldest first.
+func (b *bandwidthSampler) snapshot() []bandwidthSample {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]bandwidthSample, len(b.samples))
+	copy(out, b.samples)
+	return out
+}
+
+// aggregateBytes sums the lifetime byte counters across live tunnels.
+func (s *Server) aggregateBytes() (in, out int64) {
+	for _, t := range s.reg.List() {
+		if t.counters == nil {
+			continue
+		}
+		in += t.counters.bytesIn.Load()
+		out += t.counters.bytesOut.Load()
+	}
+	return in, out
+}
+
+// sampleBandwidth appends a throughput sample when the ring is stale or new
+// bytes have moved since the last one (or force is set).
+func (s *Server) sampleBandwidth(now time.Time, force bool) {
+	if s.bw == nil {
+		return
+	}
+	in, out := s.aggregateBytes()
+	s.bw.append(now, in, out, force)
+}
+
+// bandwidthLoop samples on a ticker until ctx is done, so the chart keeps
+// history even when the dashboard is closed.
+func (s *Server) bandwidthLoop(ctx context.Context) {
+	if s.bw == nil {
+		return
+	}
+	t := time.NewTicker(s.bw.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			s.sampleBandwidth(now, false)
+		}
+	}
+}
+
+// handleAPIBandwidth serves GET /api/bandwidth: the bounded ring of recent
+// aggregate throughput samples backing the dashboard chart.
+func (s *Server) handleAPIBandwidth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.sampleBandwidth(time.Now(), false)
+	samples := []bandwidthSample{}
+	interval := float64(0)
+	if s.bw != nil {
+		samples = s.bw.snapshot()
+		interval = s.bw.interval.Seconds()
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"interval_seconds": interval,
+		"samples":          samples,
+	})
 }
 
 type tunnelView struct {
@@ -173,12 +344,17 @@ func (s *Server) handleAPITokens(w http.ResponseWriter, r *http.Request) {
 		list := s.tokens.List()
 		views := make([]map[string]any, 0, len(list))
 		for _, rec := range list {
-			views = append(views, map[string]any{
+			view := map[string]any{
 				"name":        rec.Name,
 				"token_hint":  maskToken(rec.Token),
 				"permissions": rec.Permissions,
 				"created_at":  rec.CreatedAt,
-			})
+				"expired":     rec.expired(),
+			}
+			if rec.ExpiresAt != nil {
+				view["expires_at"] = *rec.ExpiresAt
+			}
+			views = append(views, view)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"tokens": views})
 
@@ -226,6 +402,25 @@ func (s *Server) handleAPITokens(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "pass ?token=... or ?name=...", http.StatusBadRequest)
+
+	case http.MethodPut:
+		// Rotate issues a fresh secret for an existing named token.
+		q := r.URL.Query()
+		name := q.Get("name")
+		if name == "" {
+			http.Error(w, "pass ?name=...", http.StatusBadRequest)
+			return
+		}
+		secret, err := s.tokens.rotate(name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.audit(r, "token.rotate", name, "secret rotated")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  name,
+			"token": secret, // full value, shown once
+		})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -302,9 +497,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
   .btn:hover { background:rgba(128,128,128,.15); }
   .empty { color: #888; padding: 2rem 0; }
   .status-2 { color:#16a34a; } .status-3 { color:#2563eb; } .status-4 { color:#a16207; } .status-5 { color:#dc2626; }
+  .chart { width: 100%; height: 190px; display: block; }
+  .legend { display: flex; gap: 1.1rem; font-size: .78rem; color: #888; margin-top: .3rem; }
+  .swatch { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin-right: .3rem; vertical-align: -1px; }
+  .sw-in { background: #2563eb; } .sw-out { background: #16a34a; }
 </style></head><body><main>
   <h1>AriTun</h1>
-  <div class="meta">v`+view.ServerVersion+` &middot; `+fmt.Sprint(view.TunnelCount)+` active tunnel(s) &middot; `+fmt.Sprint(view.TotalRequests)+` request(s) total</div>`)
+  <div class="meta">v`+view.ServerVersion+` &middot; `+fmt.Sprint(view.TunnelCount)+` active tunnel(s) &middot; `+fmt.Sprint(view.TotalRequests)+` request(s) total</div>
+  <h2>Bandwidth</h2>
+  <canvas id="bwchart" class="chart"></canvas>
+  <div class="legend">
+    <span><span class="swatch sw-in"></span>in</span>
+    <span><span class="swatch sw-out"></span>out</span>
+    <span id="bwrange"></span>
+  </div>`)
 	if len(view.Tunnels) == 0 {
 		fmt.Fprint(w, `<div class="empty">No tunnels yet. Start one with <code>aritun http 3000</code>.</div>`)
 	} else {
@@ -384,6 +590,117 @@ async function act(id, action) {
   const r = await fetch('/api/tunnels/' + id + '/' + action, {method:'POST'});
   if (r.ok) location.reload();
 }
+
+// Bandwidth chart: fetch /api/bandwidth and draw a two-series (in/out) area
+// chart on a canvas. Plain canvas 2D, no dependencies. If the fetch fails the
+// last drawing is kept, so a flaky admin API never breaks the dashboard.
+async function bwRefresh() {
+  var cv = document.getElementById('bwchart');
+  if (!cv) return;
+  var data;
+  try {
+    var r = await fetch('/api/bandwidth');
+    if (!r.ok) throw new Error('' + r.status);
+    data = await r.json();
+  } catch (e) {
+    return; // degrade gracefully: keep the previous chart
+  }
+  var s = (data && data.samples) || [];
+  var range = document.getElementById('bwrange');
+  if (range) {
+    var secs = Math.round((data.interval_seconds || 0) * s.length);
+    range.textContent = s.length ? ('last ' + (secs >= 60 ? Math.round(secs / 60) + ' min' : secs + ' s')) : '';
+  }
+  bwDraw(cv, s);
+}
+
+function bwDraw(cv, s) {
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth || 640, h = cv.clientHeight || 180;
+  cv.width = Math.round(w * dpr);
+  cv.height = Math.round(h * dpr);
+  var g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  var fg = getComputedStyle(document.body).color;
+  var padL = 54, padR = 10, padT = 10, padB = 22;
+  var iw = w - padL - padR, ih = h - padT - padB;
+  g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+
+  var max = 0;
+  for (var i = 0; i < s.length; i++) {
+    max = Math.max(max, s[i].bytes_in || 0, s[i].bytes_out || 0);
+  }
+  if (!s.length || max <= 0) {
+    g.fillStyle = fg;
+    g.globalAlpha = 0.55;
+    g.fillText(s.length ? 'no traffic in this window' : 'no samples yet', padL + 10, padT + ih / 2);
+    g.globalAlpha = 1;
+    return;
+  }
+
+  function fmt(n) {
+    var u = ['B', 'KiB', 'MiB', 'GiB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+  }
+  function xs(i) { return padL + (s.length < 2 ? iw / 2 : (iw * i) / (s.length - 1)); }
+  function yOf(v) { return padT + ih - (ih * v) / max; }
+
+  // Grid + y-axis labels.
+  g.globalAlpha = 0.35;
+  g.strokeStyle = fg;
+  g.fillStyle = fg;
+  g.lineWidth = 1;
+  for (var k = 0; k <= 4; k++) {
+    var y = padT + ih - (ih * k) / 4 + 0.5;
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + iw, y); g.stroke();
+    g.fillText(fmt((max * k) / 4), 4, y + 3.5);
+  }
+  g.globalAlpha = 1;
+
+  // Two-series area + line.
+  function series(key, color) {
+    g.beginPath();
+    g.moveTo(xs(0), padT + ih);
+    for (var i = 0; i < s.length; i++) g.lineTo(xs(i), yOf(s[i][key] || 0));
+    g.lineTo(xs(s.length - 1), padT + ih);
+    g.closePath();
+    g.fillStyle = color;
+    g.globalAlpha = 0.16;
+    g.fill();
+    g.globalAlpha = 1;
+    g.beginPath();
+    for (var j = 0; j < s.length; j++) {
+      if (j) g.lineTo(xs(j), yOf(s[j][key] || 0));
+      else g.moveTo(xs(j), yOf(s[j][key] || 0));
+    }
+    g.strokeStyle = color;
+    g.lineWidth = 1.5;
+    g.stroke();
+  }
+  series('bytes_in', '#2563eb');
+  series('bytes_out', '#16a34a');
+
+  // x-axis labels: first / middle / last sample time.
+  g.globalAlpha = 0.55;
+  g.fillStyle = fg;
+  function xlabel(idx, align, x) {
+    var d = new Date(s[idx].t);
+    var txt = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+    g.textAlign = align;
+    g.fillText(txt, x, h - 6);
+    g.textAlign = 'left';
+  }
+  xlabel(0, 'left', padL);
+  if (s.length > 2) xlabel((s.length / 2) | 0, 'center', xs((s.length / 2) | 0));
+  xlabel(s.length - 1, 'right', padL + iw);
+  g.globalAlpha = 1;
+}
+
+bwDraw(document.getElementById('bwchart'), []);
+bwRefresh();
+setInterval(bwRefresh, 10000);
 </script>
 </body></html>`)
 }

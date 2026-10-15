@@ -108,6 +108,13 @@ type Server struct {
 	oauth     *oauthProviders
 	startedAt time.Time
 
+	// adminLim rate limits the admin HTTP surface per client IP (defense in
+	// depth: the admin binds loopback by default but may be exposed).
+	adminLim *adminLimiter
+	// bw keeps a bounded ring of aggregate throughput samples backing the
+	// dashboard chart and /api/bandwidth.
+	bw *bandwidthSampler
+
 	mu        sync.Mutex
 	sessions  map[string]*Session
 	listeners map[string]net.Listener   // tunnel id -> tcp listener
@@ -127,6 +134,8 @@ func New(cfg Config, log *slog.Logger) *Server {
 		ports:     newPortAllocator(cfg.TCPMin, cfg.TCPMax),
 		insp:      newInspector(500),
 		startedAt: time.Now(),
+		adminLim:  newAdminLimiter(adminRatePerSec, adminRateBurst),
+		bw:        newBandwidthSampler(bandwidthInterval, bandwidthRetention),
 		sessions:  make(map[string]*Session),
 		listeners: make(map[string]net.Listener),
 		udpConns:  make(map[string]net.PacketConn),
@@ -138,6 +147,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 	if cfg.OAuthBase != "" {
 		s.oauth = newOAuthProviders(cfg.OAuthBase)
 	}
+	s.loadPersisted()
 	return s
 }
 
@@ -420,6 +430,7 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	r = CaptureBody(r)
 	s.reverseProxy(t).ServeHTTP(cw, r)
+	markUpgradeStatus(r, cw)
 	t.counters.record(statusOf(cw), int(cw.bytes))
 	s.recordRequest(t, r, cw, start)
 }
@@ -491,6 +502,7 @@ func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunn
 	cw := &countingWriter{ResponseWriter: w}
 	start := time.Now()
 	s.reverseProxyMulti(t, port, r.Host).ServeHTTP(cw, r2)
+	markUpgradeStatus(r2, cw)
 	t.counters.record(statusOf(cw), int(cw.bytes))
 	s.recordRequest(t, r2, cw, start)
 }
@@ -601,6 +613,20 @@ func (s *Server) reverseProxy(t *Tunnel) *httputil.ReverseProxy {
 		}
 	})
 	return t.httpProxy
+}
+
+// markUpgradeStatus records a protocol upgrade as the 101 it was. When a
+// request switches protocols, httputil.ReverseProxy hijacks the connection
+// and writes the switching-protocols response straight onto the socket, so
+// the counting writer never sees a status line; without this the inspector
+// and the metrics would log the upgraded connection as an ordinary 200.
+func markUpgradeStatus(r *http.Request, cw *countingWriter) {
+	if cw.status != 0 || r == nil || r.Header.Get("Upgrade") == "" {
+		return
+	}
+	if headerContainsToken(r.Header.Get("Connection"), "upgrade") {
+		cw.status = http.StatusSwitchingProtocols
+	}
 }
 
 // openStream asks the owning client for a fresh data stream.

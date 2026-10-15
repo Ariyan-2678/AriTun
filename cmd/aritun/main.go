@@ -119,6 +119,8 @@ func run(args []string) error {
 		return cmdStatus(args[1:])
 	case "inspect":
 		return cmdInspect(args[1:])
+	case "logs":
+		return cmdLogs(args[1:])
 	case "pause":
 		return cmdPauseResume(args[1:], "pause")
 	case "resume":
@@ -152,9 +154,11 @@ Usage:
   aritun http all [--include-ephemeral] [--ports 3000,8080]   publish all web ports as HTTP
   aritun tcp  <port> [--allow CIDR] [--deny CIDR] [--bandwidth BYTES]
   aritun udp  <port> [--allow CIDR] [--deny CIDR] [--bandwidth BYTES]
+  aritun udp all [--ports 51820,3478] [--exclude 1900] [--include-ephemeral]
   aritun all  [--ports 3000,8080] [--exclude 445,135] [--http-only|--tcp-only]
   aritun status    [--admin http://host:9090]
   aritun inspect   [--admin http://host:9090] [--tunnel ID] [--follow]
+  aritun logs      [--admin http://host:9090] [--tunnel ID] [-f=false] [-n 50]
   aritun pause     <tunnel-id> [--admin http://host:9090]
   aritun resume    <tunnel-id> [--admin http://host:9090]
   aritun install-service [--args "http 3000 --subdomain demo"]
@@ -179,9 +183,11 @@ Examples:
   aritun http 3000 --allow 10.0.0.0/8 --rate 20 --bandwidth 10485760
   aritun http all                    # all web ports as HTTPS URLs
   aritun tcp 3389
+  aritun udp all                     # discover local UDP services, one tunnel each
   aritun all
   aritun status        # derives the admin URL from --server
   aritun inspect --follow
+  aritun logs -n 100   # tail the server's request log
   aritun pause t_ab12cd
   aritun install-service --args "http 3000"
 `)
@@ -194,7 +200,7 @@ var boolFlags = map[string]bool{
 	"help": true, "h": true, "version": true,
 	"http-only": true, "tcp-only": true, "json": true,
 	"include-ephemeral": true, "headers": true, "curl": true,
-	"follow": true, "uninstall": true,
+	"follow": true, "uninstall": true, "f": true,
 }
 
 // normalizeArgs moves positional arguments to the end so the flag package can
@@ -343,6 +349,11 @@ func cmdTCP(args []string) error {
 }
 
 func cmdUDP(args []string) error {
+	// `aritun udp all` → discover and publish every local UDP service.
+	if len(args) > 0 && args[0] == "all" {
+		return cmdUDPAll(args[1:])
+	}
+
 	var g globals
 	var policy tunnelPolicy
 	fs := flag.NewFlagSet("udp", flag.ContinueOnError)
@@ -370,7 +381,53 @@ func cmdUDP(args []string) error {
 	return serve(&g, []protocol.Tunnel{tunnel})
 }
 
-// discoveryOptions builds the discovery settings for `aritun all`, excluding
+// cmdUDPAll implements `aritun udp all`: discover local UDP services and
+// publish one UDP tunnel per port, each with its own public port.
+func cmdUDPAll(args []string) error {
+	var g globals
+	var policy tunnelPolicy
+	fs := flag.NewFlagSet("udp all", flag.ContinueOnError)
+	portsFlag := fs.String("ports", "", "comma separated ports; skips discovery")
+	excludeFlag := fs.String("exclude", "", "comma separated ports to skip")
+	includeEphemeral := fs.Bool("include-ephemeral", false,
+		"also publish high-numbered dynamic ports")
+	policy.register(fs)
+	g.register(fs)
+	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
+		return err
+	}
+
+	opts := discoveryOptions(g, parseIntSet(*excludeFlag))
+	opts.ExcludeEphemeral = !*includeEphemeral
+	if *portsFlag != "" {
+		ports, err := parseIntList(*portsFlag)
+		if err != nil {
+			return err
+		}
+		opts.Ports = ports
+	}
+
+	fmt.Fprintln(os.Stderr, "scanning local UDP listeners...")
+	found, err := client.DiscoverLocalUDPPorts(opts)
+	if err != nil {
+		return fmt.Errorf("UDP port discovery: %w", err)
+	}
+	if len(found) == 0 {
+		return fmt.Errorf("no listening UDP ports found on this machine")
+	}
+
+	tunnels := make([]protocol.Tunnel, 0, len(found))
+	for _, p := range found {
+		tunnel := protocol.Tunnel{Type: protocol.TypeUDP, LocalPort: p}
+		policy.apply(&tunnel)
+		tunnels = append(tunnels, tunnel)
+	}
+	return serve(&g, tunnels)
+}
+
 // both the ports we publish explicitly and the ports of the infrastructure we
 // are dialling through.
 //

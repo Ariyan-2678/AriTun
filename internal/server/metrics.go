@@ -38,8 +38,24 @@ func (s *Server) renderMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# TYPE aritun_uptime_seconds gauge\n")
 	fmt.Fprintf(&b, "aritun_uptime_seconds %.0f\n", now.Sub(s.startedAt).Seconds())
 
-	// Per-tunnel counters.
+	// Server-wide cumulative byte totals, aggregated across live tunnels.
 	tunnels := s.reg.List()
+	var totalIn, totalOut int64
+	for _, t := range tunnels {
+		if t.counters == nil {
+			continue
+		}
+		totalIn += t.counters.bytesIn.Load()
+		totalOut += t.counters.bytesOut.Load()
+	}
+	fmt.Fprintf(&b, "# HELP aritun_bytes_in_total Cumulative bytes received from visitors across all tunnels.\n")
+	fmt.Fprintf(&b, "# TYPE aritun_bytes_in_total counter\n")
+	fmt.Fprintf(&b, "aritun_bytes_in_total %d\n", totalIn)
+	fmt.Fprintf(&b, "# HELP aritun_bytes_out_total Cumulative bytes sent to visitors across all tunnels.\n")
+	fmt.Fprintf(&b, "# TYPE aritun_bytes_out_total counter\n")
+	fmt.Fprintf(&b, "aritun_bytes_out_total %d\n", totalOut)
+
+	// Per-tunnel counters.
 	if len(tunnels) > 0 {
 		fmt.Fprintf(&b, "# HELP aritun_tunnel_requests_total Requests per tunnel.\n")
 		fmt.Fprintf(&b, "# TYPE aritun_tunnel_requests_total counter\n")

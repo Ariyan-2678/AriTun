@@ -109,9 +109,11 @@ func New(cfg Config, requested []protocol.Tunnel, log *slog.Logger) (*Client, er
 		return nil, err
 	}
 	return &Client{
-		cfg:       cfg,
-		log:       log,
-		requested: requested,
+		cfg: cfg,
+		log: log,
+		// Copy so a caller reusing its slice after New cannot mutate the
+		// tunnel set a reconnect would re-register.
+		requested: append([]protocol.Tunnel(nil), requested...),
 		active:    make(map[string]protocol.Tunnel),
 		proxy:     proxy,
 	}, nil
@@ -132,7 +134,7 @@ func (c *Client) OnUpdate(fn func([]protocol.Tunnel)) {
 // currently live (empty until the first registration completes).
 func (c *Client) SetTunnels(t []protocol.Tunnel) []protocol.Tunnel {
 	c.mu.Lock()
-	c.requested = t
+	c.requested = append([]protocol.Tunnel(nil), t...)
 	c.mu.Unlock()
 	return c.Snapshot()
 }
@@ -151,9 +153,9 @@ func (c *Client) Snapshot() []protocol.Tunnel {
 // Run maintains the connection until ctx is cancelled. It reconnects forever,
 // backing off between attempts.
 func (c *Client) Run(ctx context.Context) error {
-	backoff := time.Second
+	bo := newBackoff()
 	for {
-		err := c.runOnce(ctx)
+		healthy, err := c.runOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -167,22 +169,22 @@ func (c *Client) Run(ctx context.Context) error {
 					"  If the server uses a self-signed certificate, pass --ca <path to control-cert.pem>.\n"+
 					"  --insecure skips verification; use it only for local testing.", err)}
 		}
+		if healthy {
+			// The session made it to welcome/register, so the server is
+			// reachable; start the curve over instead of climbing from a
+			// stale cap.
+			bo.reset()
+		}
+		delay := bo.next()
 		if err != nil {
-			c.log.Warn("connection lost, retrying", "err", err, "in", backoff)
-		} else {
-			// The session was healthy until it dropped: start the next wait
-			// from the short end of the curve instead of a stale 30s.
-			backoff = time.Second
+			c.log.Warn("connection lost, retrying", "err", err, "in", delay)
 		}
 		c.clearActive()
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
+		case <-time.After(delay):
 		}
 	}
 }
@@ -197,10 +199,14 @@ func (c *Client) clearActive() {
 	}
 }
 
-func (c *Client) runOnce(ctx context.Context) error {
+// runOnce drives one full control session: dial, handshake, register the
+// requested tunnels, then serve until the session dies. healthy reports
+// whether the session reached welcome/register, which tells Run that the
+// server is reachable and the backoff curve can start over.
+func (c *Client) runOnce(ctx context.Context) (healthy bool, err error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return false, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
 
@@ -211,17 +217,17 @@ func (c *Client) runOnce(ctx context.Context) error {
 		Name:    c.cfg.Name,
 		Version: protocol.Version,
 	}); err != nil {
-		return err
+		return false, err
 	}
 	welcome, err := protocol.ReadMsg(conn)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if welcome.Op == protocol.OpError {
-		return &FatalError{Reason: "server rejected us: " + welcome.Error}
+		return false, &FatalError{Reason: "server rejected us: " + welcome.Error}
 	}
 	if welcome.Op != protocol.OpWelcome {
-		return fmt.Errorf("unexpected reply %q", welcome.Op)
+		return false, fmt.Errorf("unexpected reply %q", welcome.Op)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	c.log.Info("session established", "server", c.cfg.Server, "client_id", welcome.ClientID)
@@ -237,17 +243,17 @@ func (c *Client) runOnce(ctx context.Context) error {
 	msessCfg.KeepAliveInterval = 15 * time.Second
 	sess, err := yamux.Client(conn, msessCfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer sess.Close()
 
 	ctrl, err := sess.Open()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer ctrl.Close()
 	if err := protocol.WriteStreamHeader(ctrl, protocol.StreamControl, "control"); err != nil {
-		return err
+		return false, err
 	}
 
 	sendMu := &sync.Mutex{}
@@ -261,11 +267,15 @@ func (c *Client) runOnce(ctx context.Context) error {
 	desired := append([]protocol.Tunnel(nil), c.requested...)
 	c.mu.Unlock()
 	if len(desired) == 0 {
-		return errors.New("no tunnels requested")
+		return false, errors.New("no tunnels requested")
 	}
 	if err := send(&protocol.Msg{Op: protocol.OpRegister, Tunnels: desired}); err != nil {
-		return err
+		return false, err
 	}
+	// The server accepted our token and our register went out: from here a
+	// drop is a network problem, not a config problem, and the next dial
+	// deserves a fresh base backoff.
+	healthy = true
 
 	// The session is healthy as long as both loops are running.
 	errCh := make(chan error, 3)
@@ -343,9 +353,9 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return healthy, ctx.Err()
 	case err := <-errCh:
-		return err
+		return healthy, err
 	}
 }
 

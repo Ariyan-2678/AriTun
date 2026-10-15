@@ -56,7 +56,9 @@ func run(args []string) error {
 		dataDir    = fs.String("data-dir", "", "AriTun data directory (default: platform-specific)")
 		genToken   = fs.Bool("gen-token", false, "print a fresh random token and exit")
 		tokensFile = fs.String("tokens-file", "", "JSON file of named tokens with per-type permissions")
-		auditLog   = fs.String("audit-log", "",
+		tokenTTL   = fs.Duration("token-ttl", 0,
+			"default lifetime for newly created named tokens, e.g. 720h (0: never expires)")
+		auditLog = fs.String("audit-log", "",
 			"append the admin audit log to this file (empty: keep it in memory only)")
 		oauthBase = fs.String("oauth-base", "", "external base URL for OAuth callbacks, e.g. https://aritun.example.com")
 		verbose   = fs.Bool("v", false, "verbose logging")
@@ -106,6 +108,8 @@ func run(args []string) error {
 	if err := server.InitAudit(*auditLog); err != nil {
 		return err
 	}
+
+	server.SetDefaultTokenTTL(*tokenTTL)
 
 	srv := server.New(server.Config{
 		Domain:       *domain,
