@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,16 @@ import (
 type Tunnel struct {
 	protocol.Tunnel
 	Session *Session
+
+	// compiled policy — built once at register time
+	allowPrefixes []netip.Prefix
+	denyPrefixes  []netip.Prefix
+
+	// live enforcement state
+	paused    bool
+	limiter   *rateLimiter
+	bwLimiter *bandwidthLimiter
+	counters  *tunnelCounters
 }
 
 // Registry tracks every live tunnel and answers the routing lookups the public

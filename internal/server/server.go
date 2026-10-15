@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -30,6 +31,15 @@ type Config struct {
 	// Token is required in the client hello. Empty disables authentication
 	// (only sensible for local development).
 	Token string
+
+	// TokensFile points at a JSON file of named tokens with per-type
+	// permissions. It complements Token, which keeps working as a root token.
+	TokensFile string
+
+	// OAuthBase is the external base URL for OAuth callbacks, e.g.
+	// "https://aritun.example.com". Provider credentials come from the
+	// environment (see newOAuthProviders).
+	OAuthBase string
 
 	// ControlAddr is where clients dial, e.g. ":9443".
 	ControlAddr string
@@ -93,6 +103,11 @@ type Server struct {
 	reg   *Registry
 	ports *portAllocator
 
+	insp     *inspector
+	tokens   *tokenStore
+	oauth    *oauthProviders
+	startedAt time.Time
+
 	mu        sync.Mutex
 	sessions  map[string]*Session
 	listeners map[string]net.Listener // tunnel id -> tcp listener
@@ -104,14 +119,24 @@ func New(cfg Config, log *slog.Logger) *Server {
 		log = slog.Default()
 	}
 	cfg = cfg.withDefaults()
-	return &Server{
+	s := &Server{
 		cfg:       cfg,
 		log:       log,
 		reg:       newRegistry(),
 		ports:     newPortAllocator(cfg.TCPMin, cfg.TCPMax),
+		insp:      newInspector(500),
+		startedAt: time.Now(),
 		sessions:  make(map[string]*Session),
 		listeners: make(map[string]net.Listener),
 	}
+	if cfg.TokensFile != "" {
+		s.tokens = newTokenStore(cfg.TokensFile)
+		s.log.Info("named tokens loaded", "file", cfg.TokensFile, "count", len(s.tokens.List()))
+	}
+	if cfg.OAuthBase != "" {
+		s.oauth = newOAuthProviders(cfg.OAuthBase)
+	}
+	return s
 }
 
 // Registry exposes the tunnel table for the admin API.
@@ -250,7 +275,8 @@ func (s *Server) handleControlConn(conn net.Conn) {
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	sess := newSession(s, hello.Name, hello.Version, conn)
+	tokenInfo := s.resolveToken(hello.Token)
+	sess := newSession(s, hello.Name, hello.Version, conn, tokenInfo)
 	if err := protocol.WriteMsg(conn, &protocol.Msg{
 		Op:       protocol.OpWelcome,
 		ClientID: sess.id,
@@ -266,11 +292,36 @@ func (s *Server) handleControlConn(conn net.Conn) {
 }
 
 func (s *Server) checkToken(token string) error {
-	if s.cfg.Token == "" {
+	// No token system at all: allow everything (dev mode).
+	if s.cfg.Token == "" && s.tokens == nil {
 		return nil
 	}
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) != 1 {
-		return errors.New("invalid token")
+	// Legacy root token.
+	if s.cfg.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) == 1 {
+		return nil
+	}
+	// Named tokens.
+	if s.tokens != nil && s.tokens.lookup(token) != nil {
+		return nil
+	}
+	return errors.New("invalid token")
+}
+
+// resolveToken maps a hello token to a TokenInfo carrying its permissions.
+// The root token (Config.Token) gets every permission; named tokens get what
+// was configured.
+func (s *Server) resolveToken(token string) *TokenInfo {
+	if s.cfg.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) == 1 {
+		return &TokenInfo{Name: "root", Permissions: allPerms}
+	}
+	if s.tokens != nil {
+		if rec := s.tokens.lookup(token); rec != nil {
+			return &TokenInfo{Name: rec.Name, Permissions: rec.Permissions}
+		}
+	}
+	// Token-less dev mode.
+	if s.cfg.Token == "" && s.tokens == nil {
+		return nil
 	}
 	return nil
 }
@@ -299,6 +350,10 @@ func (s *Server) serveHTTP(ctx context.Context, ln net.Listener) error {
 }
 
 func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
+	// OAuth callback rides the same listener so Caddy's single TLS cert covers it.
+	if s.handleOAuthCallback(w, r) {
+		return
+	}
 	// The control channel may share this listener so that Caddy on :443 is the
 	// only TLS endpoint clients need to reach.
 	if s.handleControlUpgrade(w, r) {
@@ -317,10 +372,30 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Multi tunnel: /20128/foo -> local port 20128, path /foo
-	if t.Type == protocol.TypeMulti {
-		s.handleMultiHTTP(w, r, t)
+	// Paused tunnels answer 503 without disturbing the client's registration.
+	if t.paused {
+		http.Error(w, "tunnel paused", http.StatusServiceUnavailable)
 		return
+	}
+
+	// IP allow/deny.
+	ip := visitorIP(r.Header.Get("X-Forwarded-For"), r.RemoteAddr)
+	if !checkACL(ip, t.allowPrefixes, t.denyPrefixes) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Rate limit.
+	if t.limiter != nil && !t.limiter.allow() {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	// OAuth gate — checked before BasicAuth so the sign-in page is reachable.
+	if t.OAuth != "" {
+		if !s.oauthGate(w, r, t, sub) {
+			return
+		}
 	}
 
 	if t.BasicAuth != "" {
@@ -332,7 +407,67 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.reverseProxy(t).ServeHTTP(w, r)
+	// Multi tunnel: /20128/foo -> local port 20128, path /foo
+	if t.Type == protocol.TypeMulti {
+		s.handleMultiHTTP(w, r, t)
+		return
+	}
+
+	cw := &countingWriter{ResponseWriter: w}
+	start := time.Now()
+	s.reverseProxy(t).ServeHTTP(cw, r)
+	t.counters.record(statusOf(cw), int(cw.bytes))
+	s.insp.record(RequestLog{
+		Time:      start,
+		Method:    r.Method,
+		URL:       r.URL.Path,
+		Status:    statusOf(cw),
+		Duration:  time.Since(start).Milliseconds(),
+		Bytes:     cw.bytes,
+		RemoteIP:  ip.String(),
+		TunnelID:  t.ID,
+		Subdomain: t.Subdomain,
+		Client:    t.Session.name,
+	})
+}
+
+// oauthGate returns true when the request may proceed; otherwise it has
+// already written a redirect or an error.
+func (s *Server) oauthGate(w http.ResponseWriter, r *http.Request, t *Tunnel, subdomain string) bool {
+	if s.oauth == nil || !s.oauth.ready(t.OAuth) {
+		// Provider not configured server-side: fail open with a clear message
+		// rather than locking everyone out.
+		s.log.Warn("oauth requested but provider not configured", "provider", t.OAuth, "tunnel", t.ID)
+		return true
+	}
+	if c, err := r.Cookie(oauthCookieName(subdomain)); err == nil {
+		if _, ok := s.oauth.verifyCookie(subdomain, c.Value); ok {
+			return true
+		}
+	}
+	// Not authenticated: kick off the login flow.
+	if strings.HasPrefix(r.URL.Path, oauthCallbackPath) {
+		// Let the callback handler (mounted on the HTTP router) run.
+		return true
+	}
+	s.oauth.startLogin(w, r, t.OAuth, subdomain)
+	return false
+}
+
+// handleOAuthCallback intercepts /-/auth/callback/<provider> before subdomain
+// routing, because the callback arrives at the parent domain, not at a tunnel.
+func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) bool {
+	if s.oauth == nil || !strings.HasPrefix(r.URL.Path, oauthCallbackPath) {
+		return false
+	}
+	provider := strings.TrimPrefix(r.URL.Path, oauthCallbackPath)
+	provider = strings.TrimSuffix(provider, "/")
+	if provider != "google" && provider != "github" {
+		http.NotFound(w, r)
+		return true
+	}
+	s.oauth.handleCallback(w, r, provider)
+	return true
 }
 
 // handleMultiHTTP routes by the first path segment: /20128/api -> local port 20128, path /api.
@@ -359,7 +494,23 @@ func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunn
 	r2.URL.RawPath = ""
 	r2.RequestURI = rest
 
-	s.reverseProxyMulti(t, port, r.Host).ServeHTTP(w, r2)
+	cw := &countingWriter{ResponseWriter: w}
+	start := time.Now()
+	s.reverseProxyMulti(t, port, r.Host).ServeHTTP(cw, r2)
+	t.counters.record(statusOf(cw), int(cw.bytes))
+	ip := visitorIP(r.Header.Get("X-Forwarded-For"), r.RemoteAddr)
+	s.insp.record(RequestLog{
+		Time:      start,
+		Method:    r.Method,
+		URL:       r.URL.Path,
+		Status:    statusOf(cw),
+		Duration:  time.Since(start).Milliseconds(),
+		Bytes:     cw.bytes,
+		RemoteIP:  ip.String(),
+		TunnelID:  t.ID,
+		Subdomain: t.Subdomain,
+		Client:    t.Session.name,
+	})
 }
 
 // reverseProxyMulti builds a proxy for a multi tunnel that opens a stream
@@ -383,7 +534,14 @@ func (s *Server) reverseProxyMulti(t *Tunnel, targetPort int, reqHost string) *h
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return s.openMultiStream(tunnelID, targetPort)
+				st, err := s.openMultiStream(tunnelID, targetPort)
+				if err != nil {
+					return nil, err
+				}
+				if t.bwLimiter != nil {
+					return &limitedConn{Conn: st, bw: t.bwLimiter}, nil
+				}
+				return st, nil
 			},
 			ForceAttemptHTTP2:     false,
 			ResponseHeaderTimeout: 0,
@@ -426,7 +584,14 @@ func (s *Server) reverseProxy(t *Tunnel) *httputil.ReverseProxy {
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return s.openStream(tunnelID)
+				st, err := s.openStream(tunnelID)
+				if err != nil {
+					return nil, err
+				}
+				if t.bwLimiter != nil {
+					return &limitedConn{Conn: st, bw: t.bwLimiter}, nil
+				}
+				return st, nil
 			},
 			ForceAttemptHTTP2:     false,
 			ResponseHeaderTimeout: 0,
@@ -520,6 +685,17 @@ func (s *Server) startTCPListener(t *Tunnel) (net.Listener, error) {
 func (s *Server) pipeTCP(in net.Conn, tunnelID string) {
 	defer in.Close()
 
+	t := s.reg.ByID(tunnelID)
+	if t == nil {
+		return
+	}
+	if t.paused {
+		return
+	}
+	if !checkACL(mustAddr(in.RemoteAddr().String()), t.allowPrefixes, t.denyPrefixes) {
+		return
+	}
+
 	out, err := s.openStream(tunnelID)
 	if err != nil {
 		s.log.Debug("tcp dial failed", "tunnel", tunnelID, "err", err)
@@ -527,6 +703,25 @@ func (s *Server) pipeTCP(in net.Conn, tunnelID string) {
 	}
 	defer out.Close()
 
+	// Bandwidth limiting: wrap both ends so the shared bucket sees both
+	// directions.
+	if t.bwLimiter != nil {
+		in = &limitedConn{Conn: in, bw: t.bwLimiter}
+		out = &limitedConn{Conn: out, bw: t.bwLimiter}
+	}
+
 	s.log.Debug("tcp connection", "tunnel", tunnelID, "peer", in.RemoteAddr().String())
 	protocol.Pipe(in, out)
+}
+
+// mustAddr parses a "host:port" remote address into a netip.Addr, returning
+// the zero Addr on failure (which checkACL treats as "no match" for deny and
+// "not in allow list" — safe default).
+func mustAddr(hostPort string) netip.Addr {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		host = hostPort
+	}
+	a, _ := netip.ParseAddr(host)
+	return a
 }

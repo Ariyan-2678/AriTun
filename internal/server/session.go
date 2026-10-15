@@ -23,6 +23,7 @@ type Session struct {
 	name      string
 	version   string
 	createdAt time.Time
+	tokenInfo *TokenInfo // nil = token-less dev mode (full access)
 
 	srv  *Server
 	conn net.Conn
@@ -34,7 +35,7 @@ type Session struct {
 	done   chan struct{}
 }
 
-func newSession(s *Server, name, version string, conn net.Conn) *Session {
+func newSession(s *Server, name, version string, conn net.Conn, tokenInfo *TokenInfo) *Session {
 	if name == "" {
 		name = conn.RemoteAddr().String()
 	}
@@ -43,6 +44,7 @@ func newSession(s *Server, name, version string, conn net.Conn) *Session {
 		name:      name,
 		version:   version,
 		createdAt: time.Now(),
+		tokenInfo: tokenInfo,
 		srv:       s,
 		conn:      conn,
 		done:      make(chan struct{}),
@@ -133,7 +135,36 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 		out.ID = "t_" + randomID(6)
 		out.Error = ""
 
-		t := &Tunnel{Tunnel: out, Session: s}
+		// Permission check: does this token's grant cover the tunnel type?
+		if !s.tokenInfo.Has(req.Type) {
+			out.Error = fmt.Sprintf("token %q is not allowed to publish %s tunnels", s.tokenInfo.Name, req.Type)
+			resolved = append(resolved, out)
+			continue
+		}
+
+		t := &Tunnel{Tunnel: out, Session: s, counters: &tunnelCounters{}}
+
+		// Compile the CIDR policy once, rejecting bad entries at register time
+		// so a typo surfaces in the client's terminal, not as a silent open
+		// tunnel.
+		if len(req.Allow) > 0 || len(req.Deny) > 0 {
+			allow, err := parseCIDRs(req.Allow)
+			if err != nil {
+				out.Error = "bad --allow: " + err.Error()
+				resolved = append(resolved, out)
+				continue
+			}
+			deny, err := parseCIDRs(req.Deny)
+			if err != nil {
+				out.Error = "bad --deny: " + err.Error()
+				resolved = append(resolved, out)
+				continue
+			}
+			t.allowPrefixes = allow
+			t.denyPrefixes = deny
+		}
+		t.limiter = newRateLimiter(req.RateLimit)
+		t.bwLimiter = newBandwidthLimiter(req.BandwidthLimit)
 
 		switch req.Type {
 		case protocol.TypeHTTP, protocol.TypeMulti:

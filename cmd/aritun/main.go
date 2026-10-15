@@ -45,6 +45,8 @@ type globals struct {
 	name     string
 	proxy    string
 	verbose  bool
+	config   string // path to aritun.yaml
+	cfg      *configFile
 }
 
 func (g *globals) register(fs *flag.FlagSet) {
@@ -60,6 +62,22 @@ func (g *globals) register(fs *flag.FlagSet) {
 	fs.BoolVar(&g.noTLS, "no-tls", false, "plain TCP (local development only)")
 	fs.StringVar(&g.name, "name", "", "name shown in the dashboard (default: hostname)")
 	fs.BoolVar(&g.verbose, "v", false, "verbose logging")
+	fs.StringVar(&g.config, "config", envOr("ARITUN_CONFIG", ""),
+		"path to aritun.yaml (default: ./aritun.yaml if present)")
+}
+
+// loadConfig is called right after fs.Parse: it reads the config file (if any)
+// and overlays unset global fields. Config file values lose to explicit flags.
+func (g *globals) loadConfig() error {
+	cfg, err := loadConfig(g.config)
+	if err != nil {
+		return err
+	}
+	g.cfg = cfg
+	if cfg != nil {
+		cfg.applyGlobals(g)
+	}
+	return nil
 }
 
 func (g *globals) clientConfig() client.Config {
@@ -97,6 +115,14 @@ func run(args []string) error {
 		return cmdAll(args[1:])
 	case "status":
 		return cmdStatus(args[1:])
+	case "inspect":
+		return cmdInspect(args[1:])
+	case "pause":
+		return cmdPauseResume(args[1:], "pause")
+	case "resume":
+		return cmdPauseResume(args[1:], "resume")
+	case "install-service":
+		return cmdInstallService(args[1:])
 	case "version", "-version", "--version":
 		fmt.Println("AriTun", buildVersion(), runtime.GOOS+"/"+runtime.GOARCH)
 		return nil
@@ -120,11 +146,15 @@ func usage() {
 	fmt.Print(`AriTun - expose local ports through your own server
 
 Usage:
-  aritun http <port> [--subdomain NAME] [--auth user:pass]
+  aritun http <port> [--subdomain NAME] [--auth user:pass] [--allow CIDR] [--deny CIDR] [--rate N] [--bandwidth BYTES] [--auth-oauth google|github]
   aritun http all [--include-ephemeral] [--ports 3000,8080]   publish all web ports as HTTP
-  aritun tcp  <port>
+  aritun tcp  <port> [--allow CIDR] [--deny CIDR] [--bandwidth BYTES]
   aritun all  [--ports 3000,8080] [--exclude 445,135] [--http-only|--tcp-only]
-  aritun status [--admin http://host:9090]
+  aritun status    [--admin http://host:9090]
+  aritun inspect   [--admin http://host:9090] [--tunnel ID] [--follow]
+  aritun pause     <tunnel-id> [--admin http://host:9090]
+  aritun resume    <tunnel-id> [--admin http://host:9090]
+  aritun install-service [--args "http 3000 --subdomain demo"]
   aritun version
 
 Set --server once with ARITUN_SERVER and stop repeating it.
@@ -134,6 +164,7 @@ Global flags:
   --token   shared secret                              (env ARITUN_TOKEN)
   --ca      PEM with the server certificate            (env ARITUN_CA)
   --proxy   SOCKS5 proxy, e.g. socks5://127.0.0.1:10808 (env ARITUN_PROXY)
+  --config  YAML config file (default: ./aritun.yaml if present)
   --insecure   skip TLS verification
   --no-tls     plain TCP, local development only
   --name    label shown in the dashboard
@@ -142,10 +173,14 @@ Global flags:
 Examples:
   aritun http 3000
   aritun http 8080 --subdomain demo --auth admin:s3cret
+  aritun http 3000 --allow 10.0.0.0/8 --rate 20 --bandwidth 10485760
   aritun http all                    # all web ports as HTTPS URLs
   aritun tcp 3389
   aritun all
   aritun status        # derives the admin URL from --server
+  aritun inspect --follow
+  aritun pause t_ab12cd
+  aritun install-service --args "http 3000"
 `)
 }
 
@@ -195,11 +230,16 @@ func cmdHTTP(args []string) error {
 	}
 
 	var g globals
+	var policy tunnelPolicy
 	fs := flag.NewFlagSet("http", flag.ContinueOnError)
 	subdomain := fs.String("subdomain", "", "custom subdomain (default: random)")
 	auth := fs.String("auth", "", "require user:pass to reach the tunnel")
+	policy.register(fs)
 	g.register(fs)
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -215,13 +255,14 @@ func cmdHTTP(args []string) error {
 		sub = client.RandomSubdomain()
 	}
 
-	tunnels := []protocol.Tunnel{{
+	tunnel := protocol.Tunnel{
 		Type:      protocol.TypeHTTP,
 		LocalPort: port,
 		Subdomain: sub,
 		BasicAuth: *auth,
-	}}
-	return serve(&g, tunnels)
+	}
+	policy.apply(&tunnel)
+	return serve(&g, []protocol.Tunnel{tunnel})
 }
 
 // cmdHTTPAll implements `aritun http all`: discover local web ports and
@@ -235,6 +276,9 @@ func cmdHTTPAll(args []string) error {
 		"also publish high-numbered dynamic ports")
 	g.register(fs)
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
 		return err
 	}
 
@@ -268,9 +312,14 @@ func cmdHTTPAll(args []string) error {
 
 func cmdTCP(args []string) error {
 	var g globals
+	var policy tunnelPolicy
 	fs := flag.NewFlagSet("tcp", flag.ContinueOnError)
+	policy.register(fs)
 	g.register(fs)
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -281,11 +330,12 @@ func cmdTCP(args []string) error {
 		return fmt.Errorf("invalid port %q", fs.Arg(0))
 	}
 
-	tunnels := []protocol.Tunnel{{
+	tunnel := protocol.Tunnel{
 		Type:      protocol.TypeTCP,
 		LocalPort: port,
-	}}
-	return serve(&g, tunnels)
+	}
+	policy.apply(&tunnel)
+	return serve(&g, []protocol.Tunnel{tunnel})
 }
 
 // discoveryOptions builds the discovery settings for `aritun all`, excluding
@@ -334,6 +384,7 @@ func discoveryOptions(g globals, userExclude map[int]bool) client.DiscoverOption
 
 func cmdAll(args []string) error {
 	var g globals
+	var policy tunnelPolicy
 	fs := flag.NewFlagSet("all", flag.ContinueOnError)
 	portsFlag := fs.String("ports", "", "comma separated ports; skips discovery")
 	excludeFlag := fs.String("exclude", "", "comma separated ports to skip")
@@ -342,8 +393,12 @@ func cmdAll(args []string) error {
 	httpPortsFlag := fs.String("http-ports", "", "extra ports to treat as web services")
 	includeEphemeral := fs.Bool("include-ephemeral", false,
 		"also publish high-numbered dynamic ports (usually a mistake)")
+	policy.register(fs)
 	g.register(fs)
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
 		return err
 	}
 	if *httpOnly && *tcpOnly {
@@ -374,23 +429,28 @@ func cmdAll(args []string) error {
 	var tunnels []protocol.Tunnel
 	for _, p := range found {
 		isWeb := client.LooksLikeWeb(p, extraWeb)
+		var tunnel protocol.Tunnel
 		switch {
 		case *tcpOnly:
-			tunnels = append(tunnels, protocol.Tunnel{Type: protocol.TypeTCP, LocalPort: p})
+			tunnel = protocol.Tunnel{Type: protocol.TypeTCP, LocalPort: p}
 		case *httpOnly:
 			if isWeb {
-				tunnels = append(tunnels, protocol.Tunnel{
+				tunnel = protocol.Tunnel{
 					Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
-				})
+				}
 			}
 		default:
 			if isWeb {
-				tunnels = append(tunnels, protocol.Tunnel{
+				tunnel = protocol.Tunnel{
 					Type: protocol.TypeHTTP, LocalPort: p, Subdomain: fmt.Sprintf("p%d", p),
-				})
+				}
 			} else {
-				tunnels = append(tunnels, protocol.Tunnel{Type: protocol.TypeTCP, LocalPort: p})
+				tunnel = protocol.Tunnel{Type: protocol.TypeTCP, LocalPort: p}
 			}
+		}
+		if tunnel.Type != "" {
+			policy.apply(&tunnel)
+			tunnels = append(tunnels, tunnel)
 		}
 	}
 	if len(tunnels) == 0 {
@@ -558,6 +618,9 @@ func cmdStatus(args []string) error {
 	if err := fs.Parse(normalizeArgs(args)); err != nil {
 		return err
 	}
+	if err := g.loadConfig(); err != nil {
+		return err
+	}
 
 	base := *admin
 	if base == "" {
@@ -621,6 +684,53 @@ func humanDuration(sec int64) string {
 		return fmt.Sprintf("%dm", int(d.Minutes()))
 	}
 	return fmt.Sprintf("%dh", int(d.Hours()))
+}
+
+// tunnelPolicy carries the optional per-tunnel restrictions that both `http`
+// and `tcp` accept. They ride along in the register message.
+type tunnelPolicy struct {
+	allow          string // comma-separated CIDRs
+	deny           string
+	rateLimit      int
+	bandwidthLimit int64
+	oauth          string // "google" | "github" | ""
+}
+
+func (p *tunnelPolicy) register(fs *flag.FlagSet) {
+	fs.StringVar(&p.allow, "allow", "", "comma-separated CIDRs allowed to reach the tunnel, e.g. 10.0.0.0/8,203.0.113.5")
+	fs.StringVar(&p.deny, "deny", "", "comma-separated CIDRs blocked from the tunnel (wins over --allow)")
+	fs.IntVar(&p.rateLimit, "rate", 0, "max requests per second for http tunnels (0 = unlimited)")
+	fs.Int64Var(&p.bandwidthLimit, "bandwidth", 0, "max bytes per second across the tunnel (0 = unlimited)")
+	fs.StringVar(&p.oauth, "auth-oauth", "", "require Google or GitHub sign-in before reaching the tunnel (google|github)")
+}
+
+// apply writes the policy fields into a protocol.Tunnel.
+func (p *tunnelPolicy) apply(t *protocol.Tunnel) {
+	if p.allow != "" {
+		t.Allow = splitCSV(p.allow)
+	}
+	if p.deny != "" {
+		t.Deny = splitCSV(p.deny)
+	}
+	if p.rateLimit > 0 {
+		t.RateLimit = p.rateLimit
+	}
+	if p.bandwidthLimit > 0 {
+		t.BandwidthLimit = p.bandwidthLimit
+	}
+	if p.oauth != "" {
+		t.OAuth = p.oauth
+	}
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

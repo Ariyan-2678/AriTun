@@ -17,7 +17,7 @@ import (
 	"io"
 )
 
-const Version = "0.3.1"
+const Version = "0.4.0"
 
 // Stream kinds written as the first byte of every yamux stream.
 const (
@@ -78,12 +78,31 @@ type Msg struct {
 // set.
 type Tunnel struct {
 	ID        string `json:"id"`
-	Type      string `json:"type"` // http | tcp
+	Type      string `json:"type"` // http | tcp | multi
 	LocalPort int    `json:"local_port"`
 	Subdomain string `json:"subdomain,omitempty"`
 
 	// BasicAuth is "user:pass" required to reach an http tunnel.
 	BasicAuth string `json:"basic_auth,omitempty"`
+
+	// OAuth gates an http tunnel behind Google or GitHub sign-in. Empty means
+	// disabled. Set by the client, honored by the server.
+	OAuth string `json:"oauth,omitempty"`
+
+	// Allow and Deny are CIDR lists evaluated against the visitor's IP.
+	// Deny wins over Allow; an empty Allow means "everyone".
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+
+	// RateLimit is requests per second for http/multi tunnels (0 = unlimited).
+	RateLimit int `json:"rate_limit,omitempty"`
+
+	// BandwidthLimit is bytes per second across the whole tunnel (0 = unlimited).
+	BandwidthLimit int64 `json:"bandwidth_limit,omitempty"`
+
+	// Paused is set by the server (via the admin API) to temporarily refuse
+	// traffic without unregistering the tunnel. Clients see it in registered.
+	Paused bool `json:"paused,omitempty"`
 
 	// Filled in by the server.
 	PublicPort int    `json:"public_port,omitempty"`

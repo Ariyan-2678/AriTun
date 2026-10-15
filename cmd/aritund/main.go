@@ -55,6 +55,8 @@ func run(args []string) error {
 		tcpRange  = fs.String("tcp-range", "20000-20999", "public ports available to tcp tunnels")
 		dataDir   = fs.String("data-dir", "", "AriTun data directory (default: platform-specific)")
 		genToken  = fs.Bool("gen-token", false, "print a fresh random token and exit")
+		tokensFile = fs.String("tokens-file", "", "JSON file of named tokens with per-type permissions")
+		oauthBase = fs.String("oauth-base", "", "external base URL for OAuth callbacks, e.g. https://aritun.example.com")
 		verbose   = fs.Bool("v", false, "verbose logging")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -112,6 +114,8 @@ func run(args []string) error {
 		TCPMin:       min,
 		TCPMax:       max,
 		DataDir:      *dataDir,
+		TokensFile:   *tokensFile,
+		OAuthBase:    *oauthBase,
 	}, log)
 
 	log.Info("AriTun server starting",
