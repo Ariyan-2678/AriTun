@@ -119,6 +119,9 @@ func (s *Session) dispatch(msg *protocol.Msg, enc *controlWriter) error {
 	case protocol.OpPing:
 		enc.send(&protocol.Msg{Op: protocol.OpPong})
 		return nil
+	case protocol.OpHealth:
+		s.applyHealth(msg.Tunnels)
+		return nil
 	default:
 		return fmt.Errorf("unknown op %q", msg.Op)
 	}
@@ -143,6 +146,7 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 		}
 
 		t := &Tunnel{Tunnel: out, Session: s, counters: &tunnelCounters{}}
+		t.health.Store(true) // assume healthy until the first probe says otherwise
 
 		// Compile the CIDR policy once, rejecting bad entries at register time
 		// so a typo surfaces in the client's terminal, not as a silent open
@@ -188,6 +192,13 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 			t.PublicPort = port
 			out = t.Tunnel
 
+		case protocol.TypeUDP:
+			if req.LocalPort < 1 || req.LocalPort > 65535 {
+				out.Error = "valid --local-port required for udp tunnels"
+				break
+			}
+			out = t.Tunnel
+
 		default:
 			out.Error = fmt.Sprintf("unknown tunnel type %q", req.Type)
 		}
@@ -208,16 +219,37 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 				s.srv.reg.Remove(t.ID)
 				out.Error = err.Error()
 			}
+		} else if t.Type == protocol.TypeUDP {
+			if err := s.srv.startUDPListener(t); err != nil {
+				s.srv.reg.Remove(t.ID)
+				out.Error = err.Error()
+			}
 		}
 
 		out = t.Tunnel
 		s.srv.log.Info("tunnel published",
 			"client", s.name, "tunnel", t.ID, "type", t.Type,
 			"local", t.LocalPort, "url", t.PublicURL, "public_port", t.PublicPort)
+		s.srv.audit(nil, "tunnel.register", t.ID, s.name+" "+t.Type)
 		resolved = append(resolved, out)
 	}
 
 	return enc.send(&protocol.Msg{Op: protocol.OpRegistered, Tunnels: resolved})
+}
+
+// applyHealth records the client's latest local-service probe results. Only
+// tunnels owned by this session are updated; unknown ids are ignored.
+func (s *Session) applyHealth(reports []protocol.Tunnel) {
+	for _, rep := range reports {
+		if rep.ID == "" {
+			continue
+		}
+		t := s.srv.reg.ByID(rep.ID)
+		if t == nil || t.Session != s {
+			continue
+		}
+		t.health.Store(rep.Healthy)
+	}
 }
 
 func (s *Session) unregister(ids []string) {
@@ -278,6 +310,28 @@ func (s *Session) openMultiStream(tunnelID string, targetPort int) (net.Conn, er
 	return st, nil
 }
 
+// openUDPStream opens a udp-tunnel stream tagged with tunnelID and a target
+// local UDP port.
+func (s *Session) openUDPStream(tunnelID string, targetPort int) (net.Conn, error) {
+	select {
+	case <-s.done:
+		return nil, errors.New("client session is closed")
+	default:
+	}
+	if s.sess == nil || s.sess.IsClosed() {
+		return nil, errors.New("client session is closed")
+	}
+	st, err := s.sess.Open()
+	if err != nil {
+		return nil, err
+	}
+	if err := protocol.WriteUDPStreamHeader(st, tunnelID, targetPort); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
 // close tears down the session and every tunnel it owned.
 func (s *Session) close() {
 	s.once.Do(func() {
@@ -290,6 +344,10 @@ func (s *Session) close() {
 				if ln, ok := s.srv.listeners[id]; ok {
 					ln.Close()
 					delete(s.srv.listeners, id)
+				}
+				if uc, ok := s.srv.udpConns[id]; ok {
+					uc.Close()
+					delete(s.srv.udpConns, id)
 				}
 			}
 			s.srv.mu.Unlock()

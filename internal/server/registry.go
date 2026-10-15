@@ -3,10 +3,12 @@ package server
 import (
 	"fmt"
 	"net"
+	"net/http/httputil"
 	"net/netip"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Ariyan-2678/aritun/internal/protocol"
 )
@@ -22,10 +24,20 @@ type Tunnel struct {
 	denyPrefixes  []netip.Prefix
 
 	// live enforcement state
-	paused    bool
+	paused    atomic.Bool
 	limiter   *rateLimiter
 	bwLimiter *bandwidthLimiter
 	counters  *tunnelCounters
+
+	// Cached HTTP reverse proxy. Built lazily on first request and reused for
+	// every subsequent one so the underlying http.Transport keeps its
+	// connection pool warm — each pooled connection is one yamux stream that
+	// stays open across requests instead of a fresh stream per request.
+	// health tracks whether the client's local service was last reachable.
+	proxyOnce sync.Once
+	httpProxy *httputil.ReverseProxy
+
+	health atomic.Bool // true = local service reachable (default true until first probe)
 }
 
 // Registry tracks every live tunnel and answers the routing lookups the public

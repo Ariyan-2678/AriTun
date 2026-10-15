@@ -103,14 +103,15 @@ type Server struct {
 	reg   *Registry
 	ports *portAllocator
 
-	insp     *inspector
-	tokens   *tokenStore
-	oauth    *oauthProviders
+	insp      *inspector
+	tokens    *tokenStore
+	oauth     *oauthProviders
 	startedAt time.Time
 
 	mu        sync.Mutex
 	sessions  map[string]*Session
-	listeners map[string]net.Listener // tunnel id -> tcp listener
+	listeners map[string]net.Listener   // tunnel id -> tcp listener
+	udpConns  map[string]net.PacketConn // tunnel id -> udp socket
 }
 
 // New builds a server. It does not listen yet.
@@ -128,6 +129,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 		startedAt: time.Now(),
 		sessions:  make(map[string]*Session),
 		listeners: make(map[string]net.Listener),
+		udpConns:  make(map[string]net.PacketConn),
 	}
 	if cfg.TokensFile != "" {
 		s.tokens = newTokenStore(cfg.TokensFile)
@@ -304,6 +306,7 @@ func (s *Server) checkToken(token string) error {
 	if s.tokens != nil && s.tokens.lookup(token) != nil {
 		return nil
 	}
+	s.audit(nil, "auth.fail", maskToken(token), "invalid token")
 	return errors.New("invalid token")
 }
 
@@ -373,7 +376,7 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Paused tunnels answer 503 without disturbing the client's registration.
-	if t.paused {
+	if t.paused.Load() {
 		http.Error(w, "tunnel paused", http.StatusServiceUnavailable)
 		return
 	}
@@ -415,20 +418,10 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 
 	cw := &countingWriter{ResponseWriter: w}
 	start := time.Now()
+	r = CaptureBody(r)
 	s.reverseProxy(t).ServeHTTP(cw, r)
 	t.counters.record(statusOf(cw), int(cw.bytes))
-	s.insp.record(RequestLog{
-		Time:      start,
-		Method:    r.Method,
-		URL:       r.URL.Path,
-		Status:    statusOf(cw),
-		Duration:  time.Since(start).Milliseconds(),
-		Bytes:     cw.bytes,
-		RemoteIP:  ip.String(),
-		TunnelID:  t.ID,
-		Subdomain: t.Subdomain,
-		Client:    t.Session.name,
-	})
+	s.recordRequest(t, r, cw, start)
 }
 
 // oauthGate returns true when the request may proceed; otherwise it has
@@ -489,6 +482,7 @@ func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunn
 	}
 
 	// rewrite path (strip the port segment)
+	r = CaptureBody(r)
 	r2 := r.Clone(r.Context())
 	r2.URL.Path = rest
 	r2.URL.RawPath = ""
@@ -498,19 +492,7 @@ func (s *Server) handleMultiHTTP(w http.ResponseWriter, r *http.Request, t *Tunn
 	start := time.Now()
 	s.reverseProxyMulti(t, port, r.Host).ServeHTTP(cw, r2)
 	t.counters.record(statusOf(cw), int(cw.bytes))
-	ip := visitorIP(r.Header.Get("X-Forwarded-For"), r.RemoteAddr)
-	s.insp.record(RequestLog{
-		Time:      start,
-		Method:    r.Method,
-		URL:       r.URL.Path,
-		Status:    statusOf(cw),
-		Duration:  time.Since(start).Milliseconds(),
-		Bytes:     cw.bytes,
-		RemoteIP:  ip.String(),
-		TunnelID:  t.ID,
-		Subdomain: t.Subdomain,
-		Client:    t.Session.name,
-	})
+	s.recordRequest(t, r2, cw, start)
 }
 
 // reverseProxyMulti builds a proxy for a multi tunnel that opens a stream
@@ -571,43 +553,54 @@ func (s *Server) openMultiStream(tunnelID string, targetPort int) (net.Conn, err
 // reverseProxy builds a one-shot proxy bound to a single tunnel. Each request
 // gets its own stream to the client, which keeps the routing trivial and safe.
 func (s *Server) reverseProxy(t *Tunnel) *httputil.ReverseProxy {
-	tunnelID := t.ID
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(rp *httputil.ProxyRequest) {
-			rp.SetURL(&url.URL{Scheme: "http", Host: "aritun-upstream"})
-			// Preserve the original Host so the app behind the tunnel can
-			// build correct absolute URLs.
-			rp.Out.Host = rp.In.Host
-			// SetXForwarded overwrites any client-supplied headers with the
-			// address we actually saw.
-			rp.SetXForwarded()
-		},
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				st, err := s.openStream(tunnelID)
-				if err != nil {
-					return nil, err
-				}
-				if t.bwLimiter != nil {
-					return &limitedConn{Conn: st, bw: t.bwLimiter}, nil
-				}
-				return st, nil
+	// Build once per tunnel and reuse. A cached http.Transport keeps its
+	// connection pool warm across requests, so each pooled connection (one
+	// yamux stream) is reused via keep-alive instead of a fresh stream per
+	// request. That removes a stream open/close round trip from every
+	// subsequent request on a hot tunnel.
+	t.proxyOnce.Do(func() {
+		tunnelID := t.ID
+		t.httpProxy = &httputil.ReverseProxy{
+			Rewrite: func(rp *httputil.ProxyRequest) {
+				rp.SetURL(&url.URL{Scheme: "http", Host: "aritun-upstream"})
+				// Preserve the original Host so the app behind the tunnel can
+				// build correct absolute URLs.
+				rp.Out.Host = rp.In.Host
+				// SetXForwarded overwrites any client-supplied headers with the
+				// address we actually saw.
+				rp.SetXForwarded()
 			},
-			ForceAttemptHTTP2:     false,
-			ResponseHeaderTimeout: 0,
-		},
-		// Flush immediately so SSE, websockets and streaming bodies work.
-		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			s.log.Debug("proxy error", "tunnel", tunnelID, "err", err)
-			if errors.Is(err, yamux.ErrSessionShutdown) || strings.Contains(err.Error(), "goAway") {
-				http.Error(w, "tunnel is offline", http.StatusBadGateway)
-				return
-			}
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-		},
-	}
-	return proxy
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					st, err := s.openStream(tunnelID)
+					if err != nil {
+						return nil, err
+					}
+					if t.bwLimiter != nil {
+						return &limitedConn{Conn: st, bw: t.bwLimiter}, nil
+					}
+					return st, nil
+				},
+				ForceAttemptHTTP2:     false,
+				ResponseHeaderTimeout: 0,
+				// Keep-alive pool: reuse idle streams between requests.
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 32,
+				IdleConnTimeout:     90 * time.Second,
+			},
+			// Flush immediately so SSE, websockets and streaming bodies work.
+			FlushInterval: -1,
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				s.log.Debug("proxy error", "tunnel", tunnelID, "err", err)
+				if errors.Is(err, yamux.ErrSessionShutdown) || strings.Contains(err.Error(), "goAway") {
+					http.Error(w, "tunnel is offline", http.StatusBadGateway)
+					return
+				}
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+			},
+		}
+	})
+	return t.httpProxy
 }
 
 // openStream asks the owning client for a fresh data stream.
@@ -617,6 +610,16 @@ func (s *Server) openStream(tunnelID string) (net.Conn, error) {
 		return nil, fmt.Errorf("tunnel %s is not registered", tunnelID)
 	}
 	return t.Session.openStream(tunnelID)
+}
+
+// openUDPStream asks the owning client for a udp-tunnel stream to its local
+// UDP port.
+func (s *Server) openUDPStream(tunnelID string, localPort int) (net.Conn, error) {
+	t := s.reg.ByID(tunnelID)
+	if t == nil {
+		return nil, fmt.Errorf("tunnel %s is not registered", tunnelID)
+	}
+	return t.Session.openUDPStream(tunnelID, localPort)
 }
 
 // subdomainOf extracts the routing label from a Host header.
@@ -689,7 +692,7 @@ func (s *Server) pipeTCP(in net.Conn, tunnelID string) {
 	if t == nil {
 		return
 	}
-	if t.paused {
+	if t.paused.Load() {
 		return
 	}
 	if !checkACL(mustAddr(in.RemoteAddr().String()), t.allowPrefixes, t.denyPrefixes) {

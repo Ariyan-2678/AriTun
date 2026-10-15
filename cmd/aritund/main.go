@@ -50,12 +50,14 @@ func run(args []string) error {
 		controlKey   = fs.String("control-key", "", "control TLS private key")
 		controlHosts = fs.String("control-hosts", "",
 			"comma-separated extra SANs for the generated certificate, e.g. 203.0.113.5,aritun.yourdomain.com")
-		httpAddr  = fs.String("http-addr", "127.0.0.1:9001", "plain HTTP listener for Caddy to forward to")
-		adminAddr = fs.String("admin-addr", "127.0.0.1:9090", "dashboard and JSON API (empty to disable)")
-		tcpRange  = fs.String("tcp-range", "20000-20999", "public ports available to tcp tunnels")
-		dataDir   = fs.String("data-dir", "", "AriTun data directory (default: platform-specific)")
-		genToken  = fs.Bool("gen-token", false, "print a fresh random token and exit")
+		httpAddr   = fs.String("http-addr", "127.0.0.1:9001", "plain HTTP listener for Caddy to forward to")
+		adminAddr  = fs.String("admin-addr", "127.0.0.1:9090", "dashboard and JSON API (empty to disable)")
+		tcpRange   = fs.String("tcp-range", "20000-20999", "public ports available to tcp tunnels")
+		dataDir    = fs.String("data-dir", "", "AriTun data directory (default: platform-specific)")
+		genToken   = fs.Bool("gen-token", false, "print a fresh random token and exit")
 		tokensFile = fs.String("tokens-file", "", "JSON file of named tokens with per-type permissions")
+		auditLog   = fs.String("audit-log", "",
+			"append the admin audit log to this file (empty: keep it in memory only)")
 		oauthBase = fs.String("oauth-base", "", "external base URL for OAuth callbacks, e.g. https://aritun.example.com")
 		verbose   = fs.Bool("v", false, "verbose logging")
 	)
@@ -99,6 +101,10 @@ func run(args []string) error {
 	// The control listener must not collide with the AriTun TCP-forwarding range.
 	if *controlAddr != "" && overlapsTCPRange(*controlAddr, min, max) {
 		return fmt.Errorf("control address %s overlaps the tcp tunnel range %d-%d", *controlAddr, min, max)
+	}
+
+	if err := server.InitAudit(*auditLog); err != nil {
+		return err
 	}
 
 	srv := server.New(server.Config{

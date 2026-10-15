@@ -19,10 +19,11 @@ const (
 	PermHTTP  = "http"
 	PermTCP   = "tcp"
 	PermMulti = "multi"
+	PermUDP   = "udp"
 )
 
 // allPerms is what the legacy single --token grants.
-var allPerms = []string{PermHTTP, PermTCP, PermMulti}
+var allPerms = []string{PermHTTP, PermTCP, PermMulti, PermUDP}
 
 // TokenInfo is what checkToken hands back for a matched token.
 type TokenInfo struct {

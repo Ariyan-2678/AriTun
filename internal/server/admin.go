@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,7 @@ func (s *Server) serveAdmin(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("/api/tunnels", s.handleAPITunnels)
 	mux.HandleFunc("/api/requests", s.handleAPIRequests)
 	mux.HandleFunc("/api/tokens", s.handleAPITokens)
+	mux.HandleFunc("/api/audit", s.handleAPIAudit)
 	mux.HandleFunc("/api/tunnels/", s.handleAPITunnelAction) // /api/tunnels/{id}/{pause|resume}
 	mux.HandleFunc("/metrics", s.renderMetrics)
 	mux.HandleFunc("/", s.handleDashboard)
@@ -39,23 +41,24 @@ func (s *Server) serveAdmin(ctx context.Context, ln net.Listener) error {
 }
 
 type tunnelView struct {
-	ID            string `json:"id"`
-	Client        string `json:"client"`
-	Type          string `json:"type"`
-	LocalPort     int    `json:"local_port"`
-	Subdomain     string `json:"subdomain,omitempty"`
-	PublicURL     string `json:"public_url,omitempty"`
-	PublicPort    int    `json:"public_port,omitempty"`
-	AgeSeconds    int64  `json:"age_seconds"`
-	Paused        bool   `json:"paused"`
-	Requests      int64  `json:"requests"`
-	BytesIn       int64  `json:"bytes_in"`
-	BytesOut      int64  `json:"bytes_out"`
-	RateLimit     int    `json:"rate_limit,omitempty"`
-	BandwidthLimit int64 `json:"bandwidth_limit,omitempty"`
-	Allow         []string `json:"allow,omitempty"`
-	Deny          []string `json:"deny,omitempty"`
-	OAuth         string `json:"oauth,omitempty"`
+	ID             string   `json:"id"`
+	Client         string   `json:"client"`
+	Type           string   `json:"type"`
+	LocalPort      int      `json:"local_port"`
+	Subdomain      string   `json:"subdomain,omitempty"`
+	PublicURL      string   `json:"public_url,omitempty"`
+	PublicPort     int      `json:"public_port,omitempty"`
+	AgeSeconds     int64    `json:"age_seconds"`
+	Paused         bool     `json:"paused"`
+	Requests       int64    `json:"requests"`
+	BytesIn        int64    `json:"bytes_in"`
+	BytesOut       int64    `json:"bytes_out"`
+	RateLimit      int      `json:"rate_limit,omitempty"`
+	BandwidthLimit int64    `json:"bandwidth_limit,omitempty"`
+	Allow          []string `json:"allow,omitempty"`
+	Deny           []string `json:"deny,omitempty"`
+	OAuth          string   `json:"oauth,omitempty"`
+	Healthy        bool     `json:"healthy"`
 }
 
 type dashboardView struct {
@@ -85,7 +88,7 @@ func (s *Server) snapshot() dashboardView {
 			PublicURL:      t.PublicURL,
 			PublicPort:     t.PublicPort,
 			AgeSeconds:     int64(time.Since(t.Session.createdAt).Seconds()),
-			Paused:         t.paused,
+			Paused:         t.paused.Load(),
 			Requests:       req,
 			BytesIn:        in,
 			BytesOut:       out,
@@ -94,6 +97,7 @@ func (s *Server) snapshot() dashboardView {
 			Allow:          t.Allow,
 			Deny:           t.Deny,
 			OAuth:          t.OAuth,
+			Healthy:        t.health.Load(),
 		})
 	}
 	return dashboardView{
@@ -131,6 +135,26 @@ func (s *Server) handleAPIRequests(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"total":    s.insp.total.Load(),
 		"requests": logs,
+	})
+}
+
+// handleAPIAudit serves GET /api/audit with the recent administrative
+// actions, oldest first. Optional ?n=<count> bounds the response (default 100).
+func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	n := 100
+	if q := r.URL.Query().Get("n"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil && v > 0 {
+			n = v
+		}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"entries": globalAudit().Recent(n),
 	})
 }
 
@@ -172,6 +196,8 @@ func (s *Server) handleAPITokens(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		s.audit(r, "token.create", body.Name,
+			"permissions: "+strings.Join(body.Permissions, ","))
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"name":        body.Name,
 			"token":       secret, // full value, shown once
@@ -180,16 +206,23 @@ func (s *Server) handleAPITokens(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		q := r.URL.Query()
-		if t := q.Get("token"); t != "" {
-			if s.tokens.Remove(t) {
+		if secret := q.Get("token"); secret != "" {
+			if s.tokens.Remove(secret) {
+				// Only the masked form is ever logged.
+				s.audit(r, "token.revoke", maskToken(secret), "revoked by secret")
 				_ = json.NewEncoder(w).Encode(map[string]any{"revoked": 1})
 			} else {
 				http.Error(w, "token not found", http.StatusNotFound)
 			}
 			return
 		}
-		if n := q.Get("name"); n != "" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"revoked": s.tokens.RemoveByName(n)})
+		if name := q.Get("name"); name != "" {
+			revoked := s.tokens.RemoveByName(name)
+			if revoked > 0 {
+				s.audit(r, "token.revoke", name,
+					fmt.Sprintf("revoked %d token(s)", revoked))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"revoked": revoked})
 			return
 		}
 		http.Error(w, "pass ?token=... or ?name=...", http.StatusBadRequest)
@@ -218,11 +251,13 @@ func (s *Server) handleAPITunnelAction(w http.ResponseWriter, r *http.Request) {
 
 	switch action {
 	case "pause":
-		t.paused = true
+		t.paused.Store(true)
+		s.audit(r, "tunnel.pause", id, t.Session.name)
 		s.log.Info("tunnel paused", "tunnel", id, "client", t.Session.name)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "paused": true})
 	case "resume":
-		t.paused = false
+		t.paused.Store(false)
+		s.audit(r, "tunnel.resume", id, t.Session.name)
 		s.log.Info("tunnel resumed", "tunnel", id, "client", t.Session.name)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "paused": false})
 	default:
@@ -261,6 +296,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
   .tcp  { background: rgba(59,130,246,.16); color: #2563eb; }
   .multi{ background: rgba(168,85,247,.16); color: #9333ea; }
   .paused{ background: rgba(234,179,8,.18); color: #a16207; }
+  .down{ background: rgba(239,68,68,.16); color: #dc2626; }
   .btn { display:inline-block; padding:.2rem .55rem; border-radius:5px; border:1px solid rgba(128,128,128,.35);
          background:transparent; color:inherit; font-size:.72rem; cursor:pointer; }
   .btn:hover { background:rgba(128,128,128,.15); }
@@ -277,7 +313,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 </tr></thead><tbody>`)
 		for _, t := range view.Tunnels {
 			public := t.PublicURL
-			if t.Type == "tcp" {
+			if t.Type == "tcp" || t.Type == "udp" {
 				public = fmt.Sprintf("%s:%d", s.publicHost(), t.PublicPort)
 			}
 			local := fmt.Sprintf("%d", t.LocalPort)
@@ -290,6 +326,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			pausedTag := ""
 			if t.Paused {
 				pausedTag = ` <span class="tag paused">PAUSED</span>`
+			}
+			if !t.Healthy {
+				pausedTag += ` <span class="tag down">DOWN</span>`
 			}
 			action := "pause"
 			label := "Pause"
@@ -320,6 +359,21 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
   <td>%s</td><td>%dms</td>
   <td><code>%s</code></td><td>%s</td>
 </tr>`, l.Time.Format("15:04:05"), l.Status/100, l.Status, htmlEscape(l.Method), htmlEscape(l.URL), humanBytes(l.Bytes), l.Duration, htmlEscape(l.RemoteIP), htmlEscape(l.Client))
+		}
+		fmt.Fprint(w, `</tbody></table>`)
+	}
+
+	fmt.Fprint(w, `<h2>Recent admin actions</h2>`)
+	audits := globalAudit().Recent(10)
+	if len(audits) == 0 {
+		fmt.Fprint(w, `<div class="empty">No admin actions yet.</div>`)
+	} else {
+		fmt.Fprint(w, `<table><thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead><tbody>`)
+		for _, e := range audits {
+			fmt.Fprintf(w, `<tr>
+  <td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td>
+</tr>`, e.Time.Format("15:04:05"), htmlEscape(e.Action), htmlEscape(e.Actor),
+				htmlEscape(e.Target), htmlEscape(e.Detail))
 		}
 		fmt.Fprint(w, `</tbody></table>`)
 	}

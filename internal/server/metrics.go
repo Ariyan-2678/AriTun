@@ -49,6 +49,8 @@ func (s *Server) renderMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "# TYPE aritun_tunnel_bytes_in_total counter\n")
 		fmt.Fprintf(&b, "# HELP aritun_tunnel_paused Whether a tunnel is paused (1) or live (0).\n")
 		fmt.Fprintf(&b, "# TYPE aritun_tunnel_paused gauge\n")
+		fmt.Fprintf(&b, "# HELP aritun_tunnel_healthy Whether a tunnel's local service was last reachable (1) or not (0).\n")
+		fmt.Fprintf(&b, "# TYPE aritun_tunnel_healthy gauge\n")
 
 		// Stable order for reproducible scrapes.
 		sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].ID < tunnels[j].ID })
@@ -62,10 +64,15 @@ func (s *Server) renderMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&b, "aritun_tunnel_bytes_out_total%s %d\n", labels, c.bytesOut.Load())
 			fmt.Fprintf(&b, "aritun_tunnel_bytes_in_total%s %d\n", labels, c.bytesIn.Load())
 			paused := 0
-			if t.paused {
+			if t.paused.Load() {
 				paused = 1
 			}
 			fmt.Fprintf(&b, "aritun_tunnel_paused%s %d\n", labels, paused)
+			healthy := 0
+			if t.health.Load() {
+				healthy = 1
+			}
+			fmt.Fprintf(&b, "aritun_tunnel_healthy%s %d\n", labels, healthy)
 		}
 	}
 

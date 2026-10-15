@@ -1,6 +1,6 @@
 {
   "name": "aritun-server",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AriTun server — self-hosted tunnel server (self-hosted ngrok alternative)",
   "license": "MIT",
   "repository": {

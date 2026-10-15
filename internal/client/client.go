@@ -318,12 +318,67 @@ func (c *Client) runOnce(ctx context.Context) error {
 		}
 	}()
 
+	// Report local-service health so the dashboard can flag a tunnel whose
+	// backend went down even though the tunnel itself is still registered.
+	go func() {
+		probeAndSend := func() {
+			reports := c.probeHealth()
+			if len(reports) == 0 {
+				return
+			}
+			_ = send(&protocol.Msg{Op: protocol.OpHealth, Tunnels: reports})
+		}
+		probeAndSend() // right away on connect
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				probeAndSend()
+			}
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
 		return err
 	}
+}
+
+// probeHealth checks each active tunnel's local TCP port and returns the
+// per-tunnel health reports. multi/udp tunnels (LocalPort==0 or a UDP port)
+// are not probed over TCP and are reported healthy by omission of a negative.
+func (c *Client) probeHealth() []protocol.Tunnel {
+	c.mu.Lock()
+	active := make([]protocol.Tunnel, 0, len(c.active))
+	for _, t := range c.active {
+		active = append(active, t)
+	}
+	c.mu.Unlock()
+
+	var reports []protocol.Tunnel
+	for _, t := range active {
+		rep := protocol.Tunnel{ID: t.ID, Healthy: true}
+		if t.LocalPort > 0 && (t.Type == protocol.TypeHTTP || t.Type == protocol.TypeTCP) {
+			rep.Healthy = probeTCP(c.cfg.LocalHost, t.LocalPort)
+		}
+		reports = append(reports, rep)
+	}
+	return reports
+}
+
+// probeTCP reports whether a TCP connect to host:port succeeds quickly.
+func probeTCP(host string, port int) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprint(port)), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 func (c *Client) applyRegistered(tunnels []protocol.Tunnel) {
@@ -388,6 +443,12 @@ func (c *Client) handleData(st net.Conn) {
 		return
 	}
 
+	if kindBuf[0] == protocol.StreamUDP {
+		// Read the rest of the udp header: [2-byte id len][id][2-byte port]
+		c.handleUDPData(st)
+		return
+	}
+
 	// StreamData: read [2-byte id len][id] and dispatch.
 	// We already consumed the kind byte; reconstruct the header manually.
 	rest, err := readStreamID(st)
@@ -437,6 +498,66 @@ func (c *Client) dialLocalAndPipe(st net.Conn, port int) {
 	}
 	defer local.Close()
 	protocol.Pipe(st, local)
+}
+
+// handleUDPData relays a udp-tunnel stream to the local UDP service. The kind
+// byte was already consumed; read the remaining header then frame datagrams
+// both ways.
+func (c *Client) handleUDPData(st net.Conn) {
+	// [2-byte id len][id][2-byte port]
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(st, lenBuf[:]); err != nil {
+		return
+	}
+	idLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if idLen == 0 || idLen > 1<<16-1 {
+		return
+	}
+	id := make([]byte, idLen)
+	if _, err := io.ReadFull(st, id); err != nil {
+		return
+	}
+	var portBuf [2]byte
+	if _, err := io.ReadFull(st, portBuf[:]); err != nil {
+		return
+	}
+	port := int(binary.BigEndian.Uint16(portBuf[:]))
+	if port < 1 || port > 65535 {
+		return
+	}
+
+	local, err := net.DialTimeout("udp", net.JoinHostPort(c.cfg.LocalHost, fmt.Sprint(port)), 5*time.Second)
+	if err != nil {
+		c.log.Warn("cannot reach local udp service", "port", port, "err", err)
+		return
+	}
+	defer local.Close()
+
+	// stream -> local
+	go func() {
+		for {
+			dg, err := protocol.ReadDatagram(st)
+			if err != nil {
+				local.Close()
+				return
+			}
+			if _, err := local.Write(dg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// local -> stream
+	buf := make([]byte, 65535)
+	for {
+		n, err := local.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := protocol.WriteDatagram(st, buf[:n]); err != nil {
+			return
+		}
+	}
 }
 
 // readStreamID reads [2-byte id len][id] from the stream (kind already consumed).

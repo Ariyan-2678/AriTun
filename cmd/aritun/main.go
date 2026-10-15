@@ -111,6 +111,8 @@ func run(args []string) error {
 		return cmdHTTP(args[1:])
 	case "tcp":
 		return cmdTCP(args[1:])
+	case "udp":
+		return cmdUDP(args[1:])
 	case "all":
 		return cmdAll(args[1:])
 	case "status":
@@ -149,6 +151,7 @@ Usage:
   aritun http <port> [--subdomain NAME] [--auth user:pass] [--allow CIDR] [--deny CIDR] [--rate N] [--bandwidth BYTES] [--auth-oauth google|github]
   aritun http all [--include-ephemeral] [--ports 3000,8080]   publish all web ports as HTTP
   aritun tcp  <port> [--allow CIDR] [--deny CIDR] [--bandwidth BYTES]
+  aritun udp  <port> [--allow CIDR] [--deny CIDR] [--bandwidth BYTES]
   aritun all  [--ports 3000,8080] [--exclude 445,135] [--http-only|--tcp-only]
   aritun status    [--admin http://host:9090]
   aritun inspect   [--admin http://host:9090] [--tunnel ID] [--follow]
@@ -190,7 +193,8 @@ var boolFlags = map[string]bool{
 	"insecure": true, "no-tls": true, "v": true, "verbose": true,
 	"help": true, "h": true, "version": true,
 	"http-only": true, "tcp-only": true, "json": true,
-	"include-ephemeral": true,
+	"include-ephemeral": true, "headers": true, "curl": true,
+	"follow": true, "uninstall": true,
 }
 
 // normalizeArgs moves positional arguments to the end so the flag package can
@@ -332,6 +336,34 @@ func cmdTCP(args []string) error {
 
 	tunnel := protocol.Tunnel{
 		Type:      protocol.TypeTCP,
+		LocalPort: port,
+	}
+	policy.apply(&tunnel)
+	return serve(&g, []protocol.Tunnel{tunnel})
+}
+
+func cmdUDP(args []string) error {
+	var g globals
+	var policy tunnelPolicy
+	fs := flag.NewFlagSet("udp", flag.ContinueOnError)
+	policy.register(fs)
+	g.register(fs)
+	if err := fs.Parse(normalizeArgs(args)); err != nil {
+		return err
+	}
+	if err := g.loadConfig(); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: aritun udp <port>")
+	}
+	port, err := strconv.Atoi(fs.Arg(0))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %q", fs.Arg(0))
+	}
+
+	tunnel := protocol.Tunnel{
+		Type:      protocol.TypeUDP,
 		LocalPort: port,
 	}
 	policy.apply(&tunnel)
@@ -525,12 +557,12 @@ func printBanner(tunnels []protocol.Tunnel, reconnect bool) {
 
 	for _, t := range sorted {
 		local := fmt.Sprintf("http://localhost:%d", t.LocalPort)
-		if t.Type == protocol.TypeTCP {
-			local = fmt.Sprintf("tcp://localhost:%d", t.LocalPort)
+		if t.Type == protocol.TypeTCP || t.Type == protocol.TypeUDP {
+			local = fmt.Sprintf("%s://localhost:%d", t.Type, t.LocalPort)
 		}
 		label := t.PublicURL
-		if t.Type == protocol.TypeTCP {
-			label = fmt.Sprintf("tcp port %d", t.PublicPort)
+		if t.Type == protocol.TypeTCP || t.Type == protocol.TypeUDP {
+			label = fmt.Sprintf("%s port %d", t.Type, t.PublicPort)
 		}
 		fmt.Printf("  %-40s  ->  %s\n", label, local)
 	}
@@ -567,8 +599,8 @@ func printBannerMulti(tunnels []protocol.Tunnel, ports []int, reconnect bool) {
 }
 
 func describe(t protocol.Tunnel) string {
-	if t.Type == protocol.TypeTCP {
-		return fmt.Sprintf("tcp port %d", t.PublicPort)
+	if t.Type == protocol.TypeTCP || t.Type == protocol.TypeUDP {
+		return fmt.Sprintf("%s port %d", t.Type, t.PublicPort)
 	}
 	return t.PublicURL
 }
@@ -666,8 +698,8 @@ func cmdStatus(args []string) error {
 	fmt.Printf("AriTun server v%s · %d AriTun forwarding rule(s) active\n\n", view.ServerVersion, view.TunnelCount)
 	for _, t := range view.Tunnels {
 		public := t.PublicURL
-		if t.Type == protocol.TypeTCP {
-			public = fmt.Sprintf("tcp port %d", t.PublicPort)
+		if t.Type == protocol.TypeTCP || t.Type == protocol.TypeUDP {
+			public = fmt.Sprintf("%s port %d", t.Type, t.PublicPort)
 		}
 		fmt.Printf("  %-6s %-16s :%-6d -> %-44s up %s\n",
 			t.Type, t.Client, t.LocalPort, public, humanDuration(t.AgeSeconds))
