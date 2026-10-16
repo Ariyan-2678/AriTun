@@ -228,7 +228,7 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 
 		if t.Type == protocol.TypeTCP {
 			if _, err := s.srv.startTCPListener(t); err != nil {
-				s.srv.reg.Remove(t.ID)
+				s.srv.rollBack(t)
 				out.Error = err.Error()
 			}
 		} else if t.Type == protocol.TypeUDP {
@@ -241,7 +241,7 @@ func (s *Session) register(tunnels []protocol.Tunnel, enc *controlWriter) error 
 				err = s.srv.startUDPListener(t)
 			}
 			if err != nil {
-				s.srv.reg.Remove(t.ID)
+				s.srv.rollBack(t)
 				out.Error = err.Error()
 			}
 		}
@@ -284,11 +284,17 @@ func (s *Session) unregister(ids []string) {
 			continue
 		}
 		s.srv.mu.Lock()
-		if ln, ok := s.srv.listeners[id]; ok {
-			ln.Close()
+		ln, hasListener := s.srv.listeners[id]
+		if hasListener {
 			delete(s.srv.listeners, id)
 		}
 		s.srv.mu.Unlock()
+		if hasListener {
+			ln.Close()
+		}
+		// The UDP socket is not a listener; without this it would leak until
+		// the whole session closed.
+		s.srv.closeUDP(id)
 		s.srv.log.Info("tunnel removed", "client", s.name, "tunnel", t.ID, "type", t.Type)
 	}
 }
@@ -365,17 +371,21 @@ func (s *Session) close() {
 		removed := s.srv.reg.RemoveSession(s)
 		if len(removed) > 0 {
 			s.srv.mu.Lock()
+			lns := make([]net.Listener, 0, len(removed))
 			for _, id := range removed {
 				if ln, ok := s.srv.listeners[id]; ok {
-					ln.Close()
 					delete(s.srv.listeners, id)
-				}
-				if uc, ok := s.srv.udpConns[id]; ok {
-					uc.Close()
-					delete(s.srv.udpConns, id)
+					lns = append(lns, ln)
 				}
 			}
 			s.srv.mu.Unlock()
+			for _, ln := range lns {
+				ln.Close()
+			}
+			// closeUDP locks s.mu itself, so it must run after the unlock.
+			for _, id := range removed {
+				s.srv.closeUDP(id)
+			}
 		}
 
 		if s.sess != nil {

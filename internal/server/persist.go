@@ -130,6 +130,35 @@ func (p *persistStore) claim(typ string, localPort int) (persistedTunnel, bool) 
 	return res, true
 }
 
+// peek returns a copy of the reservation stored under res's key, without
+// touching anything. rollBack uses it to snapshot the record that a Registry
+// removal is about to erase.
+func (p *persistStore) peek(res persistedTunnel) (persistedTunnel, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	got, ok := p.tunnels[res.key()]
+	return got, ok
+}
+
+// portAvailableFor probes whether the port can actually be bound for typ.
+// TCP wants a listen socket, UDP a packet socket: probing a UDP reservation
+// with a TCP probe could drop a perfectly usable reservation (or keep one a
+// future udp bind could never honour).
+func portAvailableFor(typ string, port int) bool {
+	if port < 1 || port > 65535 {
+		return false
+	}
+	if typ == protocol.TypeUDP {
+		pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return false
+		}
+		pc.Close()
+		return true
+	}
+	return portFree(port)
+}
+
 // subdomainReservedFor reports whether an http/multi subdomain is held by a
 // reservation belonging to a different client name.
 func (p *persistStore) subdomainReservedFor(clientName, sub string) bool {
@@ -192,7 +221,7 @@ func (s *Server) loadPersisted() {
 			pruned++
 		case s.reg.ByPublicPort(res.PublicPort) != nil, s.ports.isReserved(res.PublicPort):
 			// Already held by a live tunnel or an earlier load pass.
-		case !portFree(res.PublicPort):
+		case !portAvailableFor(res.Type, res.PublicPort):
 			// Occupied by something outside this server; the reservation can
 			// never be honoured, so drop it rather than block the port.
 			_ = p.remove(res)
@@ -247,11 +276,46 @@ func (s *Server) claimPersistedPort(typ string, localPort int) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	if res.PublicPort < s.cfg.TCPMin || res.PublicPort > s.cfg.TCPMax || !portFree(res.PublicPort) {
+	if res.PublicPort < s.cfg.TCPMin || res.PublicPort > s.cfg.TCPMax || !portAvailableFor(typ, res.PublicPort) {
 		return 0, false
 	}
 	s.ports.unreserve(res.PublicPort)
 	return res.PublicPort, true
+}
+
+// rollBack removes a tunnel whose listener failed to start. Registry.Remove
+// also erases the tunnel's persisted reservation — which may be a record this
+// identity re-claimed from before a restart — so the record is snapshotted
+// before the removal and written back afterwards. A transient bind failure
+// must not permanently delete someone's stable URL or port.
+func (s *Server) rollBack(t *Tunnel) {
+	p := s.reg.persisted()
+	var prior persistedTunnel
+	var had bool
+	if p != nil && t.Session != nil {
+		prior, had = p.peek(persistedTunnel{
+			ClientName: t.Session.name,
+			Type:       t.Type,
+			Subdomain:  t.Subdomain,
+			LocalPort:  t.LocalPort,
+		})
+	}
+
+	s.reg.Remove(t.ID)
+
+	if !had || prior.PublicPort == 0 {
+		return
+	}
+	// claimPersistedPort already unreserved the port before the listener
+	// failed; put it back under reservation so another client cannot grab it
+	// while the owner retries.
+	if (prior.Type == protocol.TypeTCP || prior.Type == protocol.TypeUDP) &&
+		!s.ports.isReserved(prior.PublicPort) && portAvailableFor(prior.Type, prior.PublicPort) {
+		s.ports.reserve(prior.PublicPort)
+	}
+	if err := p.upsert(prior); err != nil {
+		s.log.Warn("restore reservation after rollback", "tunnel", t.ID, "err", err)
+	}
 }
 
 // subdomainReservedFor reports whether sub is held by a persisted reservation
@@ -263,26 +327,4 @@ func (s *Server) subdomainReservedFor(clientName, sub string) bool {
 		return false
 	}
 	return p.subdomainReservedFor(clientName, sub)
-}
-
-// startUDPListenerPort is startUDPListener for a re-awarded public port: the
-// port came from a persisted reservation, so it must be bound as-is instead of
-// going through the allocator.
-func (s *Server) startUDPListenerPort(t *Tunnel, port int) error {
-	t.PublicPort = port
-
-	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	s.udpConns[t.ID] = conn
-	s.mu.Unlock()
-
-	s.log.Info("udp tunnel published", "tunnel", t.ID, "public", port, "client", t.Session.name)
-
-	go s.serveUDP(conn, t)
-	go s.sweepUDPFlows(t.ID)
-	return nil
 }

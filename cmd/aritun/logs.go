@@ -78,11 +78,15 @@ func cmdLogs(args []string) error {
 	if err != nil {
 		return err
 	}
-	// tail -f semantics: start from the last --n lines, then stream.
+	// tail -f semantics: start from the last --n lines, then stream. The
+	// initial seen set must cover the whole ring, not just the printed tail —
+	// otherwise the first tick re-prints every older buffered entry as new.
 	seen := make(map[string]bool, len(logs))
+	for _, l := range logs {
+		seen[key(l)] = true
+	}
 	for _, l := range tailN(logs, *n) {
 		printLogLine(l)
-		seen[key(l)] = true
 	}
 	if !follow {
 		return nil

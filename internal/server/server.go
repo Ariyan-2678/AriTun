@@ -119,6 +119,7 @@ type Server struct {
 	sessions  map[string]*Session
 	listeners map[string]net.Listener   // tunnel id -> tcp listener
 	udpConns  map[string]net.PacketConn // tunnel id -> udp socket
+	udpFlows  map[string]*udpFlowTable  // tunnel id -> visitor flow table
 }
 
 // New builds a server. It does not listen yet.
@@ -139,6 +140,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 		sessions:  make(map[string]*Session),
 		listeners: make(map[string]net.Listener),
 		udpConns:  make(map[string]net.PacketConn),
+		udpFlows:  make(map[string]*udpFlowTable),
 	}
 	if cfg.TokensFile != "" {
 		s.tokens = newTokenStore(cfg.TokensFile)
