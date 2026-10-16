@@ -145,6 +145,49 @@ func TestLoadServerConfigExplicitMissing(t *testing.T) {
 	}
 }
 
+func TestLoadServerConfigRejectsUnknownKeys(t *testing.T) {
+	// A misspelled key must fail the boot rather than silently do nothing —
+	// otherwise the server would run on defaults while the operator believes
+	// the config took effect.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aritund.yaml")
+	if err := os.WriteFile(path, []byte("donmain: oops.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadServerConfigAndApply(path, newTestFlags())
+	if err == nil || !strings.Contains(err.Error(), "donmain") {
+		t.Errorf("error = %v, want an unknown-field error naming the bad key", err)
+	}
+
+	path2 := filepath.Join(dir, "aritund2.yaml")
+	if err := os.WriteFile(path2, []byte("domain: fine.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs2 := newTestFlags()
+	if _, err := loadServerConfigAndApply(path2, fs2); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	if got := fs2.Lookup("domain").Value.String(); got != "fine.example" {
+		t.Errorf("domain = %q, want fine.example", got)
+	}
+}
+
+func TestLoadServerConfigEmptyFile(t *testing.T) {
+	// An empty (or comment-only) config file is valid and applies nothing.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aritund.yaml")
+	if err := os.WriteFile(path, []byte("# nothing yet\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := loadServerConfigAndApply(path, newTestFlags())
+	if err != nil {
+		t.Fatalf("empty config rejected: %v", err)
+	}
+	if applied != path {
+		t.Errorf("applied = %q, want %q", applied, path)
+	}
+}
+
 func TestLoadServerConfigNoFile(t *testing.T) {
 	// Nonexistent CWD-relative defaults plus an unlikely tempdir make the
 	// search fall through to "no config".

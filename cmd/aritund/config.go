@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,7 +70,11 @@ func loadServerConfig(path string) (*serverConfigFile, string, error) {
 		return nil, path, fmt.Errorf("read config %s: %w", path, err)
 	}
 	var cfg serverConfigFile
-	if err := yaml.Unmarshal(b, &cfg); err != nil {
+	// Strict decoding: an unknown or misspelled key must fail the boot instead
+	// of silently leaving the matching flag at its default.
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil && err != io.EOF {
 		return nil, path, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return &cfg, path, nil
