@@ -17,7 +17,7 @@ import (
 	"io"
 )
 
-const Version = "0.6.0"
+const Version = "0.6.1"
 
 // Stream kinds written as the first byte of every yamux stream.
 const (
