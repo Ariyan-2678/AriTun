@@ -78,13 +78,21 @@ The client opens one outbound connection. Control and data streams are multiplex
 | `aritun http <port> --subdomain demo` | Choose the public subdomain |
 | `aritun http <port> --auth user:pass` | Protect an HTTP forwarding with Basic Auth |
 | `aritun tcp <port>` | Publish a raw TCP service such as SSH or RDP |
+| `aritun udp <port>` | Publish a local UDP service |
+| `aritun udp all` | Discover and publish local UDP listeners |
 | `aritun all` | Discover and publish local listeners |
 | `aritun all --ports 3000,8080` | Select ports explicitly |
 | `aritun all --exclude 445,135` | Exclude selected ports |
 | `aritun all --http-only` / `--tcp-only` | Choose forwarding type |
 | `aritun all --include-ephemeral` | Include dynamic ports (usually not desirable) |
 | `aritun status` | List active forwardings |
+| `aritun inspect [--follow] [--tunnel ID]` | Live feed of proxied requests (`--headers` adds headers, body preview and copy-as-curl) |
+| `aritun logs [-f=false] [-n 50]` | Tail the server's request log; follows by default |
+| `aritun pause <tunnel-id>` / `aritun resume <tunnel-id>` | Temporarily pause or resume one forwarding |
+| `aritun install-service --args "http 3000"` | Run the client as a system service |
 | `aritun version` | Show version and platform |
+
+Per-tunnel flags (http/tcp/udp): `--allow`/`--deny` accept CIDR allowlists and blocklists, `--rate` caps requests per second and `--bandwidth` caps bytes per second, `--auth-oauth google|github` fronts a forwarding with Google or GitHub sign-in.
 
 ### Client configuration
 
@@ -96,6 +104,9 @@ The client opens one outbound connection. Control and data streams are multiplex
 | `ARITUN_PROXY` | `--proxy` | SOCKS5 proxy, e.g. `socks5://127.0.0.1:10808` |
 | `ARITUN_ADMIN` | `--admin` | Dashboard URL for `status` |
 | `ARITUN_ADMIN_PORT` | — | Dashboard port (default `9090`) |
+| `ARITUN_CONFIG` | `--config` | YAML config file (default: `./aritun.yaml` if present) |
+
+Global flags without an env equivalent: `--insecure` (skip TLS verification), `--no-tls` (plain TCP, local development only), `--name` (dashboard label), `-v` (verbose logging).
 
 ## `all` behavior and safety
 
@@ -128,6 +139,6 @@ internal/tlsutil/   self-signed control certificate
 npm/aritun-client/   npm package (client)
 npm/aritun-server/  npm package (server)
 scripts/            release packaging
-test/               unit and end-to-end tests
+test/               smoke scripts and test helpers
 install/            systemd templates
 ```

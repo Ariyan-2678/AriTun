@@ -13,6 +13,7 @@ npm install -g aritun-client
 ```bash
 aritun http 3000
 aritun tcp 22
+aritun udp all
 aritun all
 aritun status
 aritun version

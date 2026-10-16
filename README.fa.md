@@ -78,13 +78,21 @@ aritun http 3000
 | `aritun http <port> --subdomain demo` | انتخاب subdomain عمومی |
 | `aritun http <port> --auth user:pass` | محافظت از یک forward با Basic Auth |
 | `aritun tcp <port>` | انتشار یک سرویس TCP خام مثل SSH یا RDP |
+| `aritun udp <port>` | انتشار یک سرویس UDP محلی |
+| `aritun udp all` | کشف و انتشار listenerهای UDP محلی |
 | `aritun all` | کشف و انتشار listenerهای محلی |
 | `aritun all --ports 3000,8080` | انتخاب صریح پورت‌ها |
 | `aritun all --exclude 445,135` | حذف پورت‌های مشخص |
 | `aritun all --http-only` / `--tcp-only` | انتخاب نوع forward |
 | `aritun all --include-ephemeral` | شامل‌کردن پورت‌های موقت (معمولاً ناخواسته) |
 | `aritun status` | نمایش forwardهای فعال |
+| `aritun inspect [--follow] [--tunnel ID]` | نمایش زنده‌ی درخواست‌های proxied (با `--headers` هدرها، پیش‌نمایش بدنه و دستور curl هم می‌آید) |
+| `aritun logs [-f=false] [-n 50]` | تِیل لاگ درخواست‌های سرور؛ به‌صورت پیش‌فرض فالو می‌کند |
+| `aritun pause <tunnel-id>` / `aritun resume <tunnel-id>` | توقف موقت یا ادامه‌ی یک forward |
+| `aritun install-service --args "http 3000"` | اجرای کلاینت به‌عنوان سرویس سیستمی |
 | `aritun version` | نمایش نسخه و پلتفرم |
+
+فلگ‌های هر تونل (http/tcp/udp): `--allow`/`--deny` لیست CIDR مجاز و ممنوع، `--rate` سقف درخواست در ثانیه، `--bandwidth` سقف بایت در ثانیه، و `--auth-oauth google|github` ورود با Google یا GitHub جلوی forward.
 
 ### پیکربندی کلاینت
 
@@ -96,6 +104,9 @@ aritun http 3000
 | `ARITUN_PROXY` | `--proxy` | پروکسی SOCKS5، مثلاً `socks5://127.0.0.1:10808` |
 | `ARITUN_ADMIN` | `--admin` | آدرس داشبورد برای `status` |
 | `ARITUN_ADMIN_PORT` | — | پورت داشبورد (پیش‌فرض `9090`) |
+| `ARITUN_CONFIG` | `--config` | فایل کانفیگ YAML (پیش‌فرض: `./aritun.yaml` اگر موجود باشد) |
+
+فلگ‌های عمومی بدون معادل محیطی: `--insecure` (رد کردن تأیید TLS)، `--no-tls` (TCP خام، فقط توسعه‌ی محلی)، `--name` (برچسب داشبورد)، `-v` (لاگ پرمخاطب).
 
 ## رفتار `all` و نکات امنیتی
 
@@ -128,6 +139,6 @@ internal/tlsutil/   گواهی self-signed کنترل
 npm/aritun-client/  پکیج npm (کلاینت)
 npm/aritun-server/  پکیج npm (سرور)
 scripts/            بسته‌بندی ریلیز
-test/               تست‌های unit و end-to-end
+test/               اسکریپت‌های smoke و ابزارهای تست
 install/            تمپلیت‌های systemd
 ```
