@@ -82,6 +82,14 @@ Install the service template:
 sudo cp install/aritund.service /etc/systemd/system/aritund.service
 ```
 
+**Optional — server config file:** instead of stacking flags on the unit, start from the sample:
+
+```bash
+sudo cp install/aritund.yaml.example /etc/aritun/aritund.yaml
+```
+
+The server reads `aritund.yaml` from, in order: `--config` (or `ARITUN_CONFIG`) → `/etc/aritun/aritund.yaml` → `./aritund.yaml`. Priority: CLI flags beat the file, and `ARITUN_TOKEN` still beats a `token:` inside it. Keep the file at `0600`.
+
 Set `ARITUN_DOMAIN` to your domain. If clients connect from a public IP, add that IP to `ARITUN_CONTROL_HOSTS` so the control certificate's SAN covers it. Then:
 
 ```bash
@@ -97,6 +105,7 @@ Firewall:
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow 20000:20999/tcp
+sudo ufw allow 20000:20999/udp
 ```
 
 Keep ports `9001` and `9090` bound to loopback; never expose them directly to the internet.

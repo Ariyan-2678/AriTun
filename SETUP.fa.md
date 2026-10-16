@@ -82,6 +82,14 @@ sudo chmod 0640 /etc/aritun/token
 sudo cp install/aritund.service /etc/systemd/system/aritund.service
 ```
 
+**اختیاری — فایل کانفیگ سرور:** به‌جای اینکه فلگ‌ها را داخل unit اضافه کنی، می‌توانی از فایل نمونه شروع کنی:
+
+```bash
+sudo cp install/aritund.yaml.example /etc/aritun/aritund.yaml
+```
+
+سرور `aritund.yaml` را به این ترتیب می‌خواند: `--config` (یا `ARITUN_CONFIG`) ← `/etc/aritun/aritund.yaml` ← `./aritund.yaml`. اولویت این است: فلگ‌های خط فرمان از فایل قوی‌ترند و `ARITUN_TOKEN` همچنان از `token:` داخل فایل قوی‌تر است. امتیازات فایل را روی `0600` بگذار.
+
 `ARITUN_DOMAIN` را با دامنه‌ی خودت تنظیم کن. اگر clients با public IP وصل می‌شوند، آن IP را در `ARITUN_CONTROL_HOSTS` اضافه کن تا SAN گواهی کنترل آن را پوشش دهد. سپس:
 
 ```bash
@@ -97,6 +105,7 @@ sudo journalctl -u aritund -n 30 --no-pager
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow 20000:20999/tcp
+sudo ufw allow 20000:20999/udp
 ```
 
 پورت‌های `9001` و `9090` فقط روی loopback بمانند؛ مستقیم به اینترنت بازشان نکن.

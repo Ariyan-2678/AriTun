@@ -61,9 +61,26 @@ func run(args []string) error {
 		auditLog = fs.String("audit-log", "",
 			"append the admin audit log to this file (empty: keep it in memory only)")
 		oauthBase = fs.String("oauth-base", "", "external base URL for OAuth callbacks, e.g. https://aritun.example.com")
-		verbose   = fs.Bool("v", false, "verbose logging")
+		config    = fs.String("config", envOr("ARITUN_CONFIG", ""),
+			"optional config file (default: /etc/aritun/aritund.yaml or ./aritund.yaml if present)")
+		verbose = fs.Bool("v", false, "verbose logging")
 	)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *genToken {
+		fmt.Println(newToken())
+		return nil
+	}
+
+	if *genToken {
+		fmt.Println(newToken())
+		return nil
+	}
+
+	cfgPath, err := loadServerConfigAndApply(*config, fs)
+	if err != nil {
 		return err
 	}
 
@@ -72,10 +89,8 @@ func run(args []string) error {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-
-	if *genToken {
-		fmt.Println(newToken())
-		return nil
+	if cfgPath != "" {
+		log.Info("config file applied", "path", cfgPath)
 	}
 
 	if *tokenFile != "" {

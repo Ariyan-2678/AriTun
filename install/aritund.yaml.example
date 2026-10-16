@@ -1,0 +1,49 @@
+# aritund.yaml — optional config file for the AriTun server.
+#
+# First file found wins when --config / ARITUN_CONFIG is not given:
+#   Linux:   /etc/aritun/aritund.yaml, ./aritund.yaml, ./aritund.yml
+#   Windows: %ProgramData%\AriTun\aritund.yaml, .\aritund.yaml, .\aritund.yml
+#
+# Priority: CLI flags > this file > built-in defaults.
+# ARITUN_TOKEN (env) still beats the token set here. A secret token is best
+# kept out of this file — prefer token_file. Lock permissions to 0600.
+
+# Parent domain for http tunnels, e.g. aritun.yourdomain.com
+domain: aritun.yourdomain.com
+
+# Client access token. Prefer token_file; a token here must be empty "" in the
+# file to fall back to env/file-generated behavior.
+# token: <shared-secret>
+token_file: /etc/aritun/token
+
+# Control plane clients dial.
+control_addr: ":9443"
+control_tls: true
+# control_cert: /etc/aritun/control-cert.pem
+# control_key:  /etc/aritun/control-key.pem
+# Extra SANs for the generated control certificate, comma-separated.
+# control_hosts: "203.0.113.5,aritun.yourdomain.com"
+
+# Plain HTTP router Caddy forwards to; dashboard listens here.
+http_addr: "127.0.0.1:9001"
+admin_addr: "127.0.0.1:9090"
+
+# Public ports available to tcp tunnels.
+tcp_range: "20000-20999"
+
+# Generated certificate, token and tunnel reservations live here.
+data_dir: /var/lib/aritun
+
+# Named tokens with per-type permissions (empty: disabled).
+# tokens_file: /etc/aritun/tokens.json
+
+# Default lifetime for newly created named tokens, e.g. 720h. "0" = never expires.
+# token_ttl: 720h
+
+# Append the admin audit log to a file (empty: keep in memory only).
+# audit_log: /var/lib/aritun/audit.log
+
+# External base URL for OAuth callbacks, e.g. https://aritun.yourdomain.com
+# oauth_base: https://aritun.yourdomain.com
+
+verbose: false

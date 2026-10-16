@@ -9,6 +9,9 @@ Environment=ARITUN_DOMAIN=aritun.yourdomain.com
 Environment=ARITUN_TOKEN_FILE=/etc/aritun/token
 # Add public IPs if clients connect by public IP instead of the domain.
 Environment=ARITUN_CONTROL_HOSTS=
+# Optional: point the daemon at a config file. Without it, /etc/aritun/aritund.yaml
+# or ./aritund.yaml is used when present (CLI flags always win over the file).
+# Environment=ARITUN_CONFIG=/etc/aritun/aritund.yaml
 
 ExecStart=/usr/local/bin/aritund \
     --domain ${ARITUN_DOMAIN} \

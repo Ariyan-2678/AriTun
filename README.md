@@ -37,6 +37,7 @@ npm install -g aritun-server
 
 ```bash
 aritund --gen-token | sudo tee /etc/aritun/token
+# optional config file: cp install/aritund.yaml.example /etc/aritun/aritund.yaml
 # see SETUP.md for Caddy, DNS, and systemd setup
 ```
 
